@@ -74,6 +74,7 @@
 #define AD_AT_USER_EXT_NAMES "gPCUserExtensionNames"
 #define AD_AT_FUNC_VERSION "gPCFunctionalityVersion"
 #define AD_AT_FLAGS "flags"
+#define AD_AT_VERSION_NUMBER "versionNumber"
 #define AD_AT_PRIMARY_GID "primaryGroupID"
 #define AD_AT_MEMBER_OF   "memberOf"
 
@@ -105,6 +106,14 @@
 int gpo_child_debug_fd = -1;
 
 /* == gpo-version constants ================================================ */
+
+#define SCOPEALIGN_INT_GPO_VERSION ad_gpo_scopealign_gpo_version
+#define AD_GPO_USER_VERSION_MASK 0xFFFF0000
+#define AD_GPO_MACHINE_VERSION_MASK 0x0000FFFF
+#define SYSVOL_INT_GPO_VERSION ad_gpo_file_system_gpo_version
+#define AD_INT_GPO_VERSION ad_gpo_container_gpo_version
+#define AD_GPO_SYSVOL_VERSION_MASK 0xFFFF0000
+#define AD_GPO_AD_VERSION_MASK 0x0000FFFF
 
 #define INI_GENERAL_SECTION "General"
 #define GPT_INI_VERSION "Version"
@@ -162,6 +171,8 @@ struct gp_gpo {
     int num_gpo_cse_guids;
     int gpo_func_version;
     int gpo_flags;
+    int gpo_container_version;
+    int gpo_file_system_version;
     bool send_to_child;
     const char *policy_filename;
 };
@@ -191,6 +202,15 @@ enum ace_eval_agp_status {
     AD_GPO_ACE_DENIED,
     AD_GPO_ACE_ALLOWED,
     AD_GPO_ACE_NEUTRAL
+};
+
+struct gp_mode_string {
+    const char *msg;
+};
+
+struct gp_mode_string gp_mode_to_str[] = {
+    { "machine" },    /* AD_GP_MODE_COMPUTER */
+    { "user" },       /* AD_GP_MODE_USER */
 };
 
 struct tevent_req *
@@ -2742,6 +2762,35 @@ int ad_gpo_cse_security_recv(struct tevent_req *req)
 
 
 /* == ad_gpo_core_send/recv helpers ======================================== */
+
+const char *ad_gpo_strmode(enum ad_gp_application_modes policy_mode)
+{
+    return gp_mode_to_str[policy_mode].msg;
+}
+
+/*
+ * Get version number of the changes for the computer or the user policy
+ * portion of a GPO depending on the policy application mode (scope)
+ */
+int
+ad_gpo_scopealign_gpo_version(int gpo_version,
+                              enum ad_gp_application_modes policy_mode)
+{
+    int scopealigned_version = -1;
+
+    if (gpo_version == -1) {
+        return scopealigned_version;
+    }
+
+    if (policy_mode == AD_GP_MODE_USER) {
+        scopealigned_version = gpo_version & AD_GPO_USER_VERSION_MASK;
+        scopealigned_version >>= 16;
+    } else if (policy_mode == AD_GP_MODE_COMPUTER) {
+        scopealigned_version = gpo_version & AD_GPO_MACHINE_VERSION_MASK;
+    }
+
+    return scopealigned_version;
+}
 
 /* == ad_gpo_core_send/recv implementation ================================= */
 
@@ -5360,6 +5409,32 @@ ad_gpo_sd_process_attrs(struct tevent_req *req,
         goto done;
     }
 
+    /* retrieve AD_AT_VERSION_NUMBER */
+    ret = sysdb_attrs_get_int32_t(result, AD_AT_VERSION_NUMBER,
+                                  &gp_gpo->gpo_container_version);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_attrs_get_int32_t failed: [%d](%s)\n",
+              ret, sss_strerror(ret));
+        goto done;
+    }
+
+    /* User GPO version is encoded in the upper 16 bits, machine GPO version
+     * in the lower 16 bits of the 32 bit GPO version */
+    if (state->policy_mode == AD_GP_MODE_COMPUTER) {
+        DEBUG(SSSDBG_TRACE_FUNC, "GPO version (AD): %d (user), *%d* (machine)\n",
+              SCOPEALIGN_INT_GPO_VERSION(gp_gpo->gpo_container_version,
+                                         AD_GP_MODE_USER),
+              SCOPEALIGN_INT_GPO_VERSION(gp_gpo->gpo_container_version,
+                                         AD_GP_MODE_COMPUTER));
+    } else if (state->policy_mode == AD_GP_MODE_USER) {
+        DEBUG(SSSDBG_TRACE_FUNC, "GPO version (AD): *%d* (user), %d (machine)\n",
+              SCOPEALIGN_INT_GPO_VERSION(gp_gpo->gpo_container_version,
+                                         AD_GP_MODE_USER),
+              SCOPEALIGN_INT_GPO_VERSION(gp_gpo->gpo_container_version,
+                                         AD_GP_MODE_COMPUTER));
+    }
+
     if (state->policy_mode == AD_GP_MODE_COMPUTER) {
         /* retrieve AD_AT_MACHINE_EXT_NAMES */
         ret = sysdb_attrs_get_el(result, AD_AT_MACHINE_EXT_NAMES, &el);
@@ -5778,7 +5853,9 @@ ad_gpo_filtering_step(struct tevent_req *req)
     }
 
     DEBUG(SSSDBG_TRACE_FUNC, "send_to_child: %d\n", send_to_child);
-    DEBUG(SSSDBG_TRACE_FUNC, "cached_gpt_version: %d\n", cached_gpt_version);
+    DEBUG(SSSDBG_TRACE_FUNC, "cached_gpt_version: %d (%s)\n",
+          SCOPEALIGN_INT_GPO_VERSION(cached_gpt_version, state->policy_mode),
+          ad_gpo_strmode(state->policy_mode));
 
     filtered_gpo->send_to_child = send_to_child;
 
@@ -5840,18 +5917,45 @@ ad_gpo_get_gpt_file_done(struct tevent_req *subreq)
         goto done;
     }
 
+    filtered_gpo->gpo_file_system_version = sysvol_gpt_version;
+
     now = time(NULL);
-    DEBUG(SSSDBG_TRACE_FUNC, "sysvol_gpt_version: %d\n", sysvol_gpt_version);
     if (filtered_gpo->send_to_child) {
         ret = sysdb_gpo_store_gpo(state->policy_target_domain,
                                   gpo_guid,
-                                  -1, sysvol_gpt_version,
+                                  filtered_gpo->gpo_container_version,
+                                  sysvol_gpt_version,
                                   state->gpo_timeout_option, now);
         if (ret != EOK) {
-            DEBUG(SSSDBG_OP_FAILURE, "Unable to store gpo cache entry: [%d](%s}\n",
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "Unable to store gpo cache entry: [%d](%s}\n",
                   ret, sss_strerror(ret));
             goto done;
         }
+    }
+
+    /*
+     * [MS-GPOL] 3.2.5.1.6:
+     * GPO MUST be considered denied if the GPO versions consisting of
+     * gpo_container_version and sysvol_gpt_version are both 0
+     */
+    if (SCOPEALIGN_INT_GPO_VERSION(filtered_gpo->gpo_container_version,
+                                   state->policy_mode) == 0 &&
+        SCOPEALIGN_INT_GPO_VERSION(filtered_gpo->gpo_file_system_version,
+                                   state->policy_mode) == 0) {
+        DEBUG(SSSDBG_TRACE_FUNC,
+              "GPO not applicable to target per filtering: "
+              "Empty %s policy portion\n",
+              ad_gpo_strmode(state->policy_mode));
+        talloc_free(discard_const(filtered_gpo->gpo_guid));
+        filtered_gpo->gpo_guid = NULL;
+    } else {
+        DEBUG(SSSDBG_TRACE_FUNC, "GPO version (%s): %d (AD), %d (sysvol)\n",
+              ad_gpo_strmode(state->policy_mode),
+              SCOPEALIGN_INT_GPO_VERSION(filtered_gpo->gpo_container_version,
+                                         state->policy_mode),
+              SCOPEALIGN_INT_GPO_VERSION(filtered_gpo->gpo_file_system_version,
+                                         state->policy_mode));
     }
 
     state->gpo_index++;

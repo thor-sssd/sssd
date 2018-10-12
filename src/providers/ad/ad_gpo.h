@@ -36,6 +36,7 @@
                       AD_AT_USER_EXT_NAMES, \
                       AD_AT_FUNC_VERSION, \
                       AD_AT_FLAGS, \
+                      AD_AT_VERSION_NUMBER, \
                       NULL}
 
 enum ad_gp_application_modes {
