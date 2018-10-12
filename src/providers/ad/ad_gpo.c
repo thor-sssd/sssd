@@ -28,11 +28,14 @@
  * are used by the public functions):
  *   ad_gpo_process_core_send/recv: GPO core engine:
  *                                  compute a list of gp_gpo objects
+ *   ad_gpo_cache_file_send/recv: retrieve and cache policy file data
+ *
+ * The GPO core engine implements following pairs of *private* functions:
  *   ad_gpo_process_target_send/recv: populate gp_target object
  *   ad_gpo_process_som_send/recv: populate list of gp_som objects
  *   ad_gpo_search_send/recv: populate list of gp_gpo objects
  *   ad_gpo_get_sd_referral_send/recv:  retrieve referred GPO data
- *   ad_gpo_cache_file_send/recv: retrieve and cache policy file data
+ *   ad_gpo_filtering_send/recv: populate list of filtered gp_gpo objects
  */
 
 #include <security/pam_modules.h>
@@ -176,9 +179,6 @@ struct ad_gpo_core_state {
     struct gp_gpo **filtered_gpos;
     int num_filtered_gpos;
     int gpo_index;
-    struct gp_gpo **cse_filtered_gpos;
-    int num_cse_filtered_gpos;
-    int cse_gpo_index;
 };
 
 enum ace_eval_agp_status {
@@ -198,8 +198,8 @@ struct tevent_req *ad_gpo_core_send(TALLOC_CTX *mem_ctx,
                                     const char *cse_guid);
 int ad_gpo_core_recv(struct tevent_req *req,
                      TALLOC_CTX *mem_ctx,
-                     struct gp_gpo ***_cse_filtered_gpos,
-                     int *_num_cse_filtered_gpos);
+                     struct gp_gpo ***_filtered_gpos,
+                     int *_num_filtered_gpos);
 
 struct tevent_req *
 ad_gpo_process_target_send(TALLOC_CTX *mem_ctx,
@@ -247,6 +247,22 @@ int ad_gpo_search_recv(struct tevent_req *req,
                        TALLOC_CTX *mem_ctx,
                        struct gp_gpo ***candidate_gpos,
                        int *num_candidate_gpos);
+
+struct tevent_req *
+ad_gpo_filtering_send(TALLOC_CTX *mem_ctx,
+                      struct tevent_context *ev,
+                      struct sss_idmap_ctx *idmap_ctx,
+                      enum ad_gp_application_modes policy_mode,
+                      struct sss_domain_info *policy_target_domain,
+                      struct gp_target *target,
+                      const char *cse_guid,
+                      struct gp_gpo **candidate_gpos,
+                      int num_candidate_gpos,
+                      int gpo_timeout_option);
+int ad_gpo_filtering_recv(struct tevent_req *req,
+                          TALLOC_CTX *mem_ctx,
+                          struct gp_gpo ***_filtered_gpos,
+                          int *_num_filtered_gpos);
 
 struct tevent_req *
 ad_gpo_cache_file_send(TALLOC_CTX *mem_ctx,
@@ -1851,6 +1867,7 @@ static void ad_gpo_connect_done(struct tevent_req *subreq);
 static void ad_gpo_process_target_done(struct tevent_req *subreq);
 static void ad_gpo_process_som_done(struct tevent_req *subreq);
 static void ad_gpo_search_done(struct tevent_req *subreq);
+static void ad_gpo_filtering_done(struct tevent_req *subreq);
 static void ad_gpo_access_core_protocol_done(struct tevent_req *subreq);
 static errno_t ad_gpo_cse_security_step(struct tevent_req *req);
 static void ad_gpo_cse_security_done(struct tevent_req *subreq);
@@ -2243,15 +2260,6 @@ ad_gpo_process_som_done(struct tevent_req *subreq)
     }
 }
 
-/*
- * This function retrieves a list of retrieved candidate_gpos and potentially
- * reduces it to a list of filtered_gpos, based on each GPO's functionality
- * version, flags and DACL.
- *
- * The function then takes the list of filtered_gpos and potentially
- * reduces it to a list of cse_filtered_gpos, based on whether each GPO's list
- * of cse_guids includes the "SecuritySettings" CSE GUID (used for HBAC).
- */
 static void
 ad_gpo_search_done(struct tevent_req *subreq)
 {
@@ -2262,7 +2270,6 @@ ad_gpo_search_done(struct tevent_req *subreq)
     struct gp_gpo **candidate_gpos = NULL;
     int num_candidate_gpos = 0;
     int i = 0;
-    const char **cse_filtered_gpo_guids;
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_core_state);
@@ -2300,71 +2307,101 @@ ad_gpo_search_done(struct tevent_req *subreq)
               state->target->group_sids[i]);
     }
 
-    ret = ad_gpo_filter_gpos(state, state->opts->idmap_ctx->map,
-                             state->target,
-                             state->policy_target_domain,
-                             state->policy_mode,
-                             candidate_gpos, num_candidate_gpos,
-                             &state->filtered_gpos,
-                             &state->num_filtered_gpos);
+    subreq = ad_gpo_filtering_send(state,
+                                   state->ev,
+                                   state->opts->idmap_ctx->map,
+                                   state->policy_mode,
+                                   state->policy_target_domain,
+                                   state->target,
+                                   state->cse_guid,
+                                   candidate_gpos, num_candidate_gpos,
+                                   dp_opt_get_int(state->ad_options, AD_GPO_CACHE_TIMEOUT));
+    if (subreq == NULL) {
+       ret = ENOMEM;
+       goto done;
+    }
+
+    tevent_req_set_callback(subreq, ad_gpo_filtering_done, req);
+
+    ret = EOK;
+
+done:
+
     if (ret != EOK) {
+        tevent_req_error(req, ret);
+    }
+}
+
+static void
+ad_gpo_filtering_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req;
+    struct ad_gpo_core_state *state;
+    int ret;
+    struct gp_gpo **filtered_gpos = NULL;
+    int num_filtered_gpos = 0;
+    int i = 0;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_core_state);
+    ret = ad_gpo_filtering_recv(subreq, state, &filtered_gpos,
+                                &num_filtered_gpos);
+
+    talloc_zfree(subreq);
+
+    if (ret != EOK && ret != ENOENT) {
         DEBUG(SSSDBG_OP_FAILURE,
-              "Unable to filter GPO list: [%d](%s)\n",
+              "Unable to get filtered GPO list: [%d](%s)\n",
               ret, sss_strerror(ret));
         goto done;
-    }
-
-    if (state->filtered_gpos[0] == NULL) {
-        /* since no applicable gpos were found, there is nothing to enforce */
+    } else if (ret == ENOENT) {
         DEBUG(SSSDBG_TRACE_FUNC,
-              "no applicable gpos found after filtering\n");
-
+              "No applicable GPOs found after filtering\n");
         ret = ERR_NOT_FOUND;
         goto done;
     }
 
-    for (i = 0; i < state->num_filtered_gpos; i++) {
+    for (i = 0; i < num_filtered_gpos; i++) {
         DEBUG(SSSDBG_TRACE_FUNC, "filtered_gpos[%d]->gpo_guid is %s\n", i,
-              state->filtered_gpos[i]->gpo_guid);
+              filtered_gpos[i]->gpo_guid);
     }
 
-    ret = ad_gpo_filter_gpos_by_cse_guid(state,
-                                         state->cse_guid,
-                                         state->filtered_gpos,
-                                         state->num_filtered_gpos,
-                                         &state->cse_filtered_gpos,
-                                         &state->num_cse_filtered_gpos);
+    if (state->cse_guid == NULL) {
+        state->filtered_gpos = talloc_steal(state, filtered_gpos);
+        state->num_filtered_gpos = num_filtered_gpos;
+        DEBUG(SSSDBG_TRACE_FUNC, "num_filtered_gpos: %d\n",
+              state->num_filtered_gpos);
+    } else {
+        ret = ad_gpo_filter_gpos_by_cse_guid(state,
+                                             state->cse_guid,
+                                             filtered_gpos,
+                                             num_filtered_gpos,
+                                             &state->filtered_gpos,
+                                             &state->num_filtered_gpos);
 
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Unable to filter GPO list by CSE_GUID: [%d](%s)\n",
-               ret, sss_strerror(ret));
-        goto done;
+        if (ret != EOK) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "Unable to filter GPO list by CSE_GUID: [%d](%s)\n",
+                   ret, sss_strerror(ret));
+            goto done;
+        }
+
+        if (state->filtered_gpos[0] == NULL) {
+            /* no gpos contain cse_guid, nothing to enforce */
+            DEBUG(SSSDBG_TRACE_FUNC,
+                  "No applicable GPOs found after cse_guid filtering\n");
+            ret = ERR_NOT_FOUND;
+            goto done;
+        }
+
+        for (i = 0; i < state->num_filtered_gpos; i++) {
+            DEBUG(SSSDBG_TRACE_FUNC, "cse_filtered_gpos[%d]->gpo_guid is %s\n", i,
+                                      state->filtered_gpos[i]->gpo_guid);
+        }
+
+        DEBUG(SSSDBG_TRACE_FUNC, "num_cse_filtered_gpos: %d\n",
+              state->num_filtered_gpos);
     }
-
-    if (state->cse_filtered_gpos[0] == NULL) {
-        /* no gpos contain "SecuritySettings" cse_guid, nothing to enforce */
-        DEBUG(SSSDBG_TRACE_FUNC,
-              "no applicable gpos found after cse_guid filtering\n");
-        ret = ERR_NOT_FOUND;
-        goto done;
-    }
-
-    /* we create and populate an array of applicable gpo-guids */
-    cse_filtered_gpo_guids =
-        talloc_array(state, const char *, state->num_cse_filtered_gpos);
-    if (cse_filtered_gpo_guids == NULL) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    for (i = 0; i < state->num_cse_filtered_gpos; i++) {
-        DEBUG(SSSDBG_TRACE_FUNC, "cse_filtered_gpos[%d]->gpo_guid is %s\n", i,
-                                  state->cse_filtered_gpos[i]->gpo_guid);
-    }
-
-    DEBUG(SSSDBG_TRACE_FUNC, "num_cse_filtered_gpos: %d\n",
-          state->num_cse_filtered_gpos);
 
     /* we have successfully computed all applicable gpos; give control back to
        the policy application task to start CSE specific GPO processing */
@@ -2611,9 +2648,6 @@ ad_gpo_core_send(TALLOC_CTX *mem_ctx,
     state->filtered_gpos = NULL;
     state->num_filtered_gpos = 0;
     state->gpo_index = 0;
-    state->cse_filtered_gpos = NULL;
-    state->num_cse_filtered_gpos = 0;
-    state->cse_gpo_index = 0;
     state->ev = ev;
     state->policy_target_name = policy_target_name;
     state->ldb_ctx = sysdb_ctx_get_ldb(state->policy_target_domain->sysdb);
@@ -2796,16 +2830,16 @@ ad_gpo_access_core_protocol_done(struct tevent_req *subreq)
 int
 ad_gpo_core_recv(struct tevent_req *req,
                  TALLOC_CTX *mem_ctx,
-                 struct gp_gpo ***_cse_filtered_gpos,
-                 int *_num_cse_filtered_gpos)
+                 struct gp_gpo ***_filtered_gpos,
+                 int *_num_filtered_gpos)
 {
     struct ad_gpo_core_state *state =
         tevent_req_data(req, struct ad_gpo_core_state);
 
     TEVENT_REQ_RETURN_ON_ERROR(req);
 
-    *_cse_filtered_gpos = talloc_steal(mem_ctx, state->cse_filtered_gpos);
-    *_num_cse_filtered_gpos = state->num_cse_filtered_gpos;
+    *_filtered_gpos = talloc_steal(mem_ctx, state->filtered_gpos);
+    *_num_filtered_gpos = state->num_filtered_gpos;
     return EOK;
 }
 
@@ -5278,6 +5312,125 @@ ad_gpo_search_recv(struct tevent_req *req,
     *num_candidate_gpos = state->num_candidate_gpos;
     return EOK;
 }
+
+/* == ad_gpo_filtering_send/recv helpers =================================== */
+
+/* == ad_gpo_filtering_send/recv implementation ============================ */
+struct ad_gpo_filtering_state {
+    struct tevent_context *ev;
+    enum ad_gp_application_modes policy_mode;
+    int gpo_timeout_option;
+    struct sss_domain_info *policy_target_domain;
+    struct gp_target *target;
+    const char *cse_guid;
+    struct gp_gpo **security_filtered_gpos;
+    int num_security_filtered_gpos;
+    struct gp_gpo **filtered_gpos;
+    int num_filtered_gpos;
+    int gpo_index;
+};
+
+/*
+ * This function takes the input list of retrieved candidate_gpos and
+ * potentially reduces it to a list of security_filtered_gpos, based on each
+ * GPO's functionality version, flags and DACL.
+ *
+ * The function then takes the list of security_filtered_gpos and starts
+ * retrieval of the file system portion (GPT.INI file) of each GPO for the
+ * remaining GPO filtering steps.
+ */
+struct tevent_req *
+ad_gpo_filtering_send(TALLOC_CTX *mem_ctx,
+                      struct tevent_context *ev,
+                      struct sss_idmap_ctx *idmap_ctx,
+                      enum ad_gp_application_modes policy_mode,
+                      struct sss_domain_info *policy_target_domain,
+                      struct gp_target *target,
+                      const char *cse_guid,
+                      struct gp_gpo **candidate_gpos,
+                      int num_candidate_gpos,
+                      int gpo_timeout_option)
+{
+    struct tevent_req *req;
+    struct ad_gpo_filtering_state *state;
+    errno_t ret;
+
+    req = tevent_req_create(mem_ctx, &state, struct ad_gpo_filtering_state);
+    if (req == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "tevent_req_create() failed\n");
+        return NULL;
+    }
+
+    state->ev = ev;
+    state->policy_mode = policy_mode;
+    state->policy_target_domain = policy_target_domain;
+    state->target = target;
+    state->gpo_timeout_option = gpo_timeout_option;
+    state->cse_guid = talloc_strdup(state, cse_guid);
+    state->security_filtered_gpos = NULL;
+    state->num_security_filtered_gpos = 0;
+    state->gpo_index = 0;
+    state->filtered_gpos = NULL;
+    state->num_filtered_gpos = 0;
+
+    ret = ad_gpo_filter_gpos(state, idmap_ctx,
+                             state->target,
+                             state->policy_target_domain,
+                             state->policy_mode,
+                             candidate_gpos, num_candidate_gpos,
+                             &state->security_filtered_gpos,
+                             &state->num_security_filtered_gpos);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Unable to filter GPO list: [%d](%s)\n",
+              ret, sss_strerror(ret));
+        goto immediately;
+    }
+
+    if (state->security_filtered_gpos[0] == NULL) {
+        /* since no applicable gpos were found, there is nothing to enforce */
+        ret = ENOENT;
+        goto immediately;
+    }
+
+    state->filtered_gpos = talloc_steal(state, state->security_filtered_gpos);
+    state->num_filtered_gpos = state->num_security_filtered_gpos;
+
+    ret = EOK;
+
+immediately:
+
+    if (ret == EOK) {
+        tevent_req_done(req);
+        return tevent_req_post(req, ev);
+    } else if (ret != EAGAIN) {
+        tevent_req_error(req, ret);
+        return tevent_req_post(req, ev);
+    }
+
+    return req;
+}
+
+int
+ad_gpo_filtering_recv(struct tevent_req *req,
+                      TALLOC_CTX *mem_ctx,
+                      struct gp_gpo ***_filtered_gpos,
+                      int *_num_filtered_gpos)
+{
+    struct ad_gpo_filtering_state *state =
+        tevent_req_data(req, struct ad_gpo_filtering_state);
+
+    TEVENT_REQ_RETURN_ON_ERROR(req);
+
+    if (state->filtered_gpos == NULL || state->filtered_gpos[0] == NULL) {
+        return ENOENT;
+    }
+
+    *_filtered_gpos = talloc_steal(mem_ctx, state->filtered_gpos);
+    *_num_filtered_gpos = state->num_filtered_gpos;
+    return EOK;
+}
+
 
 /* == ad_gpo_cache_file_send/recv helpers ================================== */
 static errno_t
