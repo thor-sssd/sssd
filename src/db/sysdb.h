@@ -1429,6 +1429,7 @@ errno_t sysdb_remove_mapped_data(struct sss_domain_info *domain,
 /* === Functions related to GPOs === */
 
 #define SYSDB_GPO_CONTAINER "cn=gpos,cn=ad,cn=custom"
+#define SYSDB_GP_RESULT_CONTAINER "cn=gp_results,"SYSDB_GPO_CONTAINER
 
 /* === Functions related to GPO entries === */
 
@@ -1436,7 +1437,8 @@ errno_t sysdb_remove_mapped_data(struct sss_domain_info *domain,
 #define SYSDB_GPO_FILTER "(objectClass="SYSDB_GPO_OC")"
 #define SYSDB_GPO_GUID_FILTER "(&(objectClass="SYSDB_GPO_OC")("SYSDB_GPO_GUID_ATTR"=%s))"
 #define SYSDB_GPO_GUID_ATTR "gpoGUID"
-#define SYSDB_GPO_VERSION_ATTR "gpoVersion"
+#define SYSDB_GPO_AD_VERSION_ATTR "containerVersion"
+#define SYSDB_GPO_SYSVOL_VERSION_ATTR "fileSystemVersion"
 #define SYSDB_GPO_TIMEOUT_ATTR "gpoPolicyFileTimeout"
 
 #define SYSDB_TMPL_GPO_BASE SYSDB_GPO_CONTAINER","SYSDB_DOM_BASE
@@ -1445,44 +1447,97 @@ errno_t sysdb_remove_mapped_data(struct sss_domain_info *domain,
 #define SYSDB_GPO_ATTRS { \
         SYSDB_NAME, \
         SYSDB_GPO_GUID_ATTR, \
-        SYSDB_GPO_VERSION_ATTR, \
+        SYSDB_GPO_AD_VERSION_ATTR, \
+        SYSDB_GPO_SYSVOL_VERSION_ATTR, \
         SYSDB_GPO_TIMEOUT_ATTR, \
         NULL }
 
 errno_t sysdb_gpo_store_gpo(struct sss_domain_info *domain,
                             const char *gpo_guid,
-                            int gpo_version,
+                            int gpo_ad_version,
+                            int gpo_sysvol_version,
                             int cache_timeout,
                             time_t now);
 
 errno_t sysdb_gpo_get_gpo_by_guid(TALLOC_CTX *mem_ctx,
                                   struct sss_domain_info *domain,
                                   const char *gpo_guid,
+                                  const char **attrs,
                                   struct ldb_result **_result);
 
 errno_t sysdb_gpo_get_gpos(TALLOC_CTX *mem_ctx,
                            struct sss_domain_info *domain,
+                           const char **attrs,
                            struct ldb_result **_result);
 
-/* === Functions related to GPO Result object === */
+/* === Functions related to CSE entries === */
 
-#define SYSDB_GPO_RESULT_OC "gpo_result"
-#define SYSDB_GPO_RESULT_FILTER "(objectClass="SYSDB_GPO_RESULT_OC")"
+#define SYSDB_CSE_OC "cse"
+#define SYSDB_CSE_FILTER "(objectClass="SYSDB_CSE_OC")"
+#define SYSDB_CSE_GUID_FILTER "(&(objectClass="SYSDB_CSE_OC")("SYSDB_CSE_GUID_ATTR"=%s))"
+#define SYSDB_CSE_GUID_ATTR "cseGUID"
+#define SYSDB_CSE_VERSION_ATTR "cseVersion"
+#define SYSDB_CSE_TIMEOUT_ATTR "csePolicyFileTimeout"
 
-#define SYSDB_TMPL_GPO_RESULT_BASE SYSDB_GPO_CONTAINER","SYSDB_DOM_BASE
-#define SYSDB_TMPL_GPO_RESULT "cn=%s,"SYSDB_TMPL_GPO_RESULT_BASE
+#define SYSDB_TMPL_CSE SYSDB_CSE_GUID_ATTR"=%s,"SYSDB_TMPL_GPO
 
-errno_t sysdb_gpo_delete_gpo_result_object(TALLOC_CTX *mem_ctx,
-                                           struct sss_domain_info *domain);
+#define SYSDB_CSE_ATTRS { \
+        SYSDB_NAME, \
+        SYSDB_CSE_GUID_ATTR, \
+        SYSDB_CSE_VERSION_ATTR, \
+        SYSDB_CSE_TIMEOUT_ATTR, \
+        NULL }
 
-errno_t sysdb_gpo_store_gpo_result_setting(struct sss_domain_info *domain,
-                                           const char *policy_setting_key,
-                                           const char *policy_setting_value);
+errno_t
+sysdb_gpo_cse_search(TALLOC_CTX *mem_ctx,
+                     struct sss_domain_info *domain,
+                     const char *cse_guid,
+                     const char **attrs,
+                     size_t *_num_gpos,
+                     struct ldb_message ***_gpos);
 
-errno_t sysdb_gpo_get_gpo_result_setting(TALLOC_CTX *mem_ctx,
-                                         struct sss_domain_info *domain,
-                                         const char *policy_setting_key,
-                                         const char **policy_setting_value);
+errno_t sysdb_gpo_store_cse(struct sss_domain_info *domain,
+                            const char *gpo_guid,
+                            const char *cse_guid,
+                            int cse_version,
+                            int cache_timeout,
+                            time_t now);
+
+errno_t sysdb_gpo_get_cse_by_guid(TALLOC_CTX *mem_ctx,
+                                  struct sss_domain_info *domain,
+                                  const char *gpo_guid,
+                                  const char *cse_guid,
+                                  const char **attrs,
+                                  struct ldb_result **_result);
+
+errno_t sysdb_gpo_get_cses(TALLOC_CTX *mem_ctx,
+                           struct sss_domain_info *domain,
+                           const char *gpo_guid,
+                           const char **attrs,
+                           struct ldb_result **_result);
+
+/* === Functions related to GP Result object === */
+
+#define SYSDB_GP_RESULT_OC "gp_result"
+#define SYSDB_GP_RESULT_FILTER "(objectClass="SYSDB_GP_RESULT_OC")"
+
+#define SYSDB_TMPL_GP_RESULT_BASE SYSDB_GP_RESULT_CONTAINER","SYSDB_DOM_BASE
+#define SYSDB_TMPL_GP_RESULT SYSDB_CSE_GUID_ATTR"=%s,"SYSDB_TMPL_GP_RESULT_BASE
+
+errno_t sysdb_gpo_delete_gp_result_object(TALLOC_CTX *mem_ctx,
+                                          struct sss_domain_info *domain,
+                                          const char *cse_guid);
+
+errno_t sysdb_gpo_store_gp_result_setting(struct sss_domain_info *domain,
+                                          const char *cse_guid,
+                                          const char *policy_setting_key,
+                                          const char *policy_setting_value);
+
+errno_t sysdb_gpo_get_gp_result_setting(TALLOC_CTX *mem_ctx,
+                                        struct sss_domain_info *domain,
+                                        const char *cse_guid,
+                                        const char *policy_setting_key,
+                                        const char **policy_setting_value);
 
 errno_t sysdb_get_sids_of_members(TALLOC_CTX *mem_ctx,
                                   struct sss_domain_info *dom,

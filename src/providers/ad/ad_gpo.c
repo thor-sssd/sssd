@@ -81,8 +81,21 @@
 
 /* == gpo-smb (using gpo-child) constants and variables ==================== */
 
-#define SMB_STANDARD_URI "smb://"
-#define BUFSIZE 65536
+#ifndef SSSD_LIBEXEC_PATH
+#error "SSSD_LIBEXEC_PATH not defined"
+#else
+#define GPO_CHILD SSSD_LIBEXEC_PATH"/gpo_child"
+#endif
+
+/* If INI_PARSE_IGNORE_NON_KVP is not defined, use 0 (no effect) */
+#ifndef INI_PARSE_IGNORE_NON_KVP
+#define INI_PARSE_IGNORE_NON_KVP 0
+#warning INI_PARSE_IGNORE_NON_KVP not defined.
+#endif
+
+#define GPT_INI "/GPT.INI"
+
+#define GPO_CHILD_LOG_FILE "gpo_child"
 
 /* fd used by the gpo_child process for logging */
 int gpo_child_debug_fd = -1;
@@ -103,18 +116,6 @@ int gpo_child_debug_fd = -1;
 
 #define GP_EXT_GUID_SECURITY "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}"
 #define GP_EXT_GUID_SECURITY_SUFFIX "/Machine/Microsoft/Windows NT/SecEdit/GptTmpl.inf"
-
-#ifndef SSSD_LIBEXEC_PATH
-#error "SSSD_LIBEXEC_PATH not defined"
-#else
-#define GPO_CHILD SSSD_LIBEXEC_PATH"/gpo_child"
-#endif
-
-/* If INI_PARSE_IGNORE_NON_KVP is not defined, use 0 (no effect) */
-#ifndef INI_PARSE_IGNORE_NON_KVP
-#define INI_PARSE_IGNORE_NON_KVP 0
-#warning INI_PARSE_IGNORE_NON_KVP not defined.
-#endif
 
 /* == common data structures and declarations ============================= */
 
@@ -1382,6 +1383,7 @@ ad_gpo_extract_policy_setting(TALLOC_CTX *mem_ctx,
  */
 static errno_t
 ad_gpo_store_cse_security_settings(struct sss_domain_info *domain,
+                                   const char *cse_guid,
                                    const char *filename)
 {
     struct ini_cfgfile *file_ctx = NULL;
@@ -1515,12 +1517,13 @@ ad_gpo_store_cse_security_settings(struct sss_domain_info *domain,
                 goto done;
             } else if (ret != ENOENT) {
                 const char *value = allow_value ? allow_value : empty_val;
-                ret = sysdb_gpo_store_gpo_result_setting(domain,
-                                                         allow_key,
-                                                         value);
+                ret = sysdb_gpo_store_gp_result_setting(domain,
+                                                        cse_guid,
+                                                        allow_key,
+                                                        value);
                 if (ret != EOK) {
                     DEBUG(SSSDBG_CRIT_FAILURE,
-                          "sysdb_gpo_store_gpo_result_setting failed for key:"
+                          "sysdb_gpo_store_gp_result_setting failed for key:"
                           "'%s' value:'%s' [%d][%s]\n", allow_key, allow_value,
                           ret, sss_strerror(ret));
                     goto done;
@@ -1542,12 +1545,13 @@ ad_gpo_store_cse_security_settings(struct sss_domain_info *domain,
                 goto done;
             } else if (ret != ENOENT) {
                 const char *value = deny_value ? deny_value : empty_val;
-                ret = sysdb_gpo_store_gpo_result_setting(domain,
-                                                         deny_key,
-                                                         value);
+                ret = sysdb_gpo_store_gp_result_setting(domain,
+                                                        cse_guid,
+                                                        deny_key,
+                                                        value);
                 if (ret != EOK) {
                     DEBUG(SSSDBG_CRIT_FAILURE,
-                          "sysdb_gpo_store_gpo_result_setting failed for key:"
+                          "sysdb_gpo_store_gp_result_setting failed for key:"
                           "'%s' value:'%s' [%d][%s]\n", deny_key, deny_value,
                           ret, sss_strerror(ret));
                     goto done;
@@ -1684,8 +1688,6 @@ ad_gpo_access_check(TALLOC_CTX *mem_ctx,
     return ret;
 }
 
-#define GPO_CHILD_LOG_FILE "gpo_child"
-
 static errno_t gpo_child_init(void)
 {
     return child_debug_init(GPO_CHILD_LOG_FILE, &gpo_child_debug_fd);
@@ -1693,13 +1695,14 @@ static errno_t gpo_child_init(void)
 
 /*
  * This function retrieves the raw policy_setting_value for the input key from
- * the GPO_Result object in the sysdb cache. It then parses the raw value and
+ * the GP result object in the sysdb cache. It then parses the raw value and
  * uses the results to populate the output parameters with the sids_list and
  * the size of the sids_list.
  */
 errno_t
 parse_policy_setting_value(TALLOC_CTX *mem_ctx,
                            struct sss_domain_info *domain,
+                           const char *cse_guid,
                            const char *key,
                            char ***_sids_list,
                            int *_sids_list_size)
@@ -1710,9 +1713,11 @@ parse_policy_setting_value(TALLOC_CTX *mem_ctx,
     int sids_list_size;
     char **sids_list = NULL;
 
-    ret = sysdb_gpo_get_gpo_result_setting(mem_ctx, domain, key, &value);
+    ret = sysdb_gpo_get_gp_result_setting(mem_ctx,
+                                          domain, cse_guid,
+                                          key, &value);
     if (ret == ENOENT) {
-        DEBUG(SSSDBG_TRACE_FUNC, "No previous GPO result\n");
+        DEBUG(SSSDBG_TRACE_FUNC, "No previous GP result\n");
         value = NULL;
     } else if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
@@ -1758,13 +1763,14 @@ parse_policy_setting_value(TALLOC_CTX *mem_ctx,
  * access is denied.
  *
  * Internally, this function retrieves the allow_value and deny_value for the
- * input gpo_map_type from the GPO Result object in the sysdb cache, parses
+ * input gpo_map_type from the GP result object in the sysdb cache, parses
  * the values into allow_sids and deny_sids, and executes the access control
  * algorithm which compares the allow_sids and deny_sids against the user_sid
  * and group_sids for the input user.
  */
 static errno_t
 ad_gpo_perform_hbac_processing(TALLOC_CTX *mem_ctx,
+                               const char *cse_guid,
                                enum gpo_access_control_mode gpo_mode,
                                enum gpo_map_type gpo_map_type,
                                const char *user,
@@ -1784,8 +1790,8 @@ ad_gpo_perform_hbac_processing(TALLOC_CTX *mem_ctx,
     deny_key = gpo_map_option_entries[gpo_map_type].deny_key;
     DEBUG(SSSDBG_TRACE_ALL, "deny_key: %s\n", deny_key);
 
-    ret = parse_policy_setting_value(mem_ctx, host_domain, allow_key,
-                                     &allow_sids, &allow_size);
+    ret = parse_policy_setting_value(mem_ctx, host_domain, cse_guid,
+                                     allow_key, &allow_sids, &allow_size);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
               "parse_policy_setting_value failed for key %s: [%d](%s)\n",
@@ -1794,8 +1800,8 @@ ad_gpo_perform_hbac_processing(TALLOC_CTX *mem_ctx,
         goto done;
     }
 
-    ret = parse_policy_setting_value(mem_ctx, host_domain, deny_key,
-                                     &deny_sids, &deny_size);
+    ret = parse_policy_setting_value(mem_ctx, host_domain, cse_guid,
+                                     deny_key, &deny_sids, &deny_size);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
               "parse_policy_setting_value failed for key %s: [%d](%s)\n",
@@ -1997,6 +2003,7 @@ immediately:
 
 static errno_t
 process_offline_gpos(TALLOC_CTX *mem_ctx,
+                     const char *cse_guid,
                      const char *user,
                      enum gpo_access_control_mode gpo_mode,
                      struct sss_domain_info *user_domain,
@@ -2007,6 +2014,7 @@ process_offline_gpos(TALLOC_CTX *mem_ctx,
     errno_t ret;
 
     ret = ad_gpo_perform_hbac_processing(mem_ctx,
+                                         cse_guid,
                                          gpo_mode,
                                          gpo_map_type,
                                          user,
@@ -2383,6 +2391,8 @@ ad_gpo_cse_security_step(struct tevent_req *req)
     int cached_gpt_version = 0;
     time_t policy_file_timeout = 0;
 
+    const char *attrs[] = SYSDB_GPO_ATTRS;
+
     state = tevent_req_data(req, struct ad_gpo_access_state);
 
     struct gp_gpo *security_cse_gpo =
@@ -2405,8 +2415,8 @@ ad_gpo_cse_security_step(struct tevent_req *req)
     DEBUG(SSSDBG_TRACE_FUNC, "gpo_guid: %s\n", security_cse_gpo->gpo_guid);
 
     security_cse_gpo->policy_filename =
-        talloc_asprintf(state,
-                        GPO_CACHE_PATH"%s%s",
+        talloc_asprintf(security_cse_gpo,
+                        GPO_CACHE_PATH"/%s%s",
                         security_cse_gpo->smb_path,
                         GP_EXT_GUID_SECURITY_SUFFIX);
     if (security_cse_gpo->policy_filename == NULL) {
@@ -2419,6 +2429,7 @@ ad_gpo_cse_security_step(struct tevent_req *req)
     ret = sysdb_gpo_get_gpo_by_guid(state,
                                     state->host_domain,
                                     security_cse_gpo->gpo_guid,
+                                    attrs,
                                     &res);
     if (ret == EOK) {
         /*
@@ -2432,9 +2443,8 @@ ad_gpo_cse_security_step(struct tevent_req *req)
          * for the entire cache entry; the cached_gpt_version never expires.
          */
 
-        cached_gpt_version = ldb_msg_find_attr_as_int(res->msgs[0],
-                                                      SYSDB_GPO_VERSION_ATTR,
-                                                      0);
+        cached_gpt_version = ldb_msg_find_attr_as_int
+            (res->msgs[0], SYSDB_GPO_SYSVOL_VERSION_ATTR, 0);
 
         policy_file_timeout = ldb_msg_find_attr_as_uint64
             (res->msgs[0], SYSDB_GPO_TIMEOUT_ATTR, 0);
@@ -2512,11 +2522,12 @@ ad_gpo_cse_security_done(struct tevent_req *subreq)
     }
 
     /*
-     * now that the policy file for this gpo have been downloaded to the
+     * now that the policy file for this cse has been downloaded to the
      * GPO CACHE, we store all of the supported keys present in the file
-     * (as part of the GPO Result object in the sysdb cache).
+     * (as part of the GP Result object in the sysdb cache).
      */
     ret = ad_gpo_store_cse_security_settings(state->host_domain,
+                                             state->cse_guid,
                                              security_cse_gpo->policy_filename);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
@@ -2531,6 +2542,7 @@ ad_gpo_cse_security_done(struct tevent_req *subreq)
     if (ret == EOK) {
         /* ret is EOK only after all GPO policy files have been downloaded */
         ret = ad_gpo_perform_hbac_processing(state,
+                                             state->cse_guid,
                                              state->gpo_mode,
                                              state->gpo_map_type,
                                              state->user,
@@ -2688,6 +2700,7 @@ ad_gpo_access_core_protocol_done(struct tevent_req *subreq)
                   ret, sss_strerror(ret));
             DEBUG(SSSDBG_TRACE_FUNC, "Preparing for offline operation.\n");
             ret = process_offline_gpos(state,
+                                       state->cse_guid,
                                        state->user,
                                        state->gpo_mode,
                                        state->user_domain,
@@ -2708,8 +2721,9 @@ ad_gpo_access_core_protocol_done(struct tevent_req *subreq)
              * Delete the result object, since there are no
              * GPOs to include in it (ERR_NOT_FOUND).
              */
-            ret = sysdb_gpo_delete_gpo_result_object(state,
-                                                     state->host_domain);
+            ret = sysdb_gpo_delete_gp_result_object(state,
+                                                    state->host_domain,
+                                                    state->cse_guid);
             if (ret != EOK) {
                 switch (ret) {
                 case ENOENT:
@@ -2752,8 +2766,9 @@ ad_gpo_access_core_protocol_done(struct tevent_req *subreq)
      * subsequent functions will add the GP Result object (and populate it
      * with resultant policy settings) for this policy application
      */
-    ret = sysdb_gpo_delete_gpo_result_object(state,
-                                             state->host_domain);
+    ret = sysdb_gpo_delete_gp_result_object(state,
+                                            state->host_domain,
+                                            state->cse_guid);
     if (ret != EOK) {
         switch (ret) {
         case ENOENT:
@@ -5535,7 +5550,8 @@ static void gpo_cache_file_done(struct tevent_req *subreq)
 
     now = time(NULL);
     DEBUG(SSSDBG_TRACE_FUNC, "sysvol_gpt_version: %d\n", sysvol_gpt_version);
-    ret = sysdb_gpo_store_gpo(state->domain, state->gpo_guid, sysvol_gpt_version,
+    ret = sysdb_gpo_store_gpo(state->domain, state->gpo_guid,
+                              -1, sysvol_gpt_version,
                               state->gpo_timeout_option, now);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE, "Unable to store gpo cache entry: [%d](%s}\n",

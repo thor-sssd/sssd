@@ -47,7 +47,7 @@ struct input_buffer {
     const char *smb_server;
     const char *smb_share;
     const char *smb_path;
-    const char *smb_cse_suffix;
+    const char *smb_file_suffix;
 };
 
 static errno_t
@@ -103,16 +103,16 @@ unpack_buffer(uint8_t *buf,
         p += len;
     }
 
-    /* smb_cse_suffix */
+    /* smb_file_suffix */
     SAFEALIGN_COPY_UINT32_CHECK(&len, buf + p, size, &p);
-    DEBUG(SSSDBG_TRACE_ALL, "smb_cse_suffix length: %d\n", len);
+    DEBUG(SSSDBG_TRACE_ALL, "smb_file_suffix length: %d\n", len);
     if (len == 0) {
         return EINVAL;
     } else {
         if (len > size - p) return EINVAL;
-        ibuf->smb_cse_suffix = talloc_strndup(ibuf, (char *)(buf + p), len);
-        if (ibuf->smb_cse_suffix == NULL) return ENOMEM;
-        DEBUG(SSSDBG_TRACE_ALL, "smb_cse_suffix: %s\n", ibuf->smb_cse_suffix);
+        ibuf->smb_file_suffix = talloc_strndup(ibuf, (char *)(buf + p), len);
+        if (ibuf->smb_file_suffix == NULL) return ENOMEM;
+        DEBUG(SSSDBG_TRACE_ALL, "smb_file_suffix: %s\n", ibuf->smb_file_suffix);
         p += len;
     }
 
@@ -273,11 +273,11 @@ done:
  * is constructed by concatenating:
  *   GPO_CACHE_PATH,
  *   input smb_path,
- *   input smb_cse_suffix
+ *   input smb_file_suffix
  * Note that the backend will later read the file from the same file path.
  */
 static errno_t gpo_cache_store_file(const char *smb_path,
-                                    const char *smb_cse_suffix,
+                                    const char *smb_file_suffix,
                                     uint8_t *buf,
                                     int buflen)
 {
@@ -297,7 +297,7 @@ static errno_t gpo_cache_store_file(const char *smb_path,
     }
 
     smb_path_with_suffix =
-        talloc_asprintf(tmp_ctx, "%s%s", smb_path, smb_cse_suffix);
+        talloc_asprintf(tmp_ctx, "%s%s", smb_path, smb_file_suffix);
     if (smb_path_with_suffix == NULL) {
         DEBUG(SSSDBG_CRIT_FAILURE, "talloc_asprintf failed.\n");
         ret = ENOMEM;
@@ -527,7 +527,7 @@ copy_smb_file_to_gpo_cache(SMBCCTX *smbc_ctx,
                            const char *smb_server,
                            const char *smb_share,
                            const char *smb_path,
-                           const char *smb_cse_suffix)
+                           const char *smb_file_suffix)
 {
     char *smb_uri = NULL;
     char *gpt_main_folder = NULL;
@@ -544,7 +544,7 @@ copy_smb_file_to_gpo_cache(SMBCCTX *smbc_ctx,
     }
 
     smb_uri = talloc_asprintf(tmp_ctx, "%s%s%s%s", smb_server,
-                              smb_share, smb_path, smb_cse_suffix);
+                              smb_share, smb_path, smb_file_suffix);
     if (smb_uri == NULL) {
         DEBUG(SSSDBG_CRIT_FAILURE, "talloc_asprintf failed.\n");
         ret = ENOMEM;
@@ -611,7 +611,7 @@ copy_smb_file_to_gpo_cache(SMBCCTX *smbc_ctx,
 
     DEBUG(SSSDBG_TRACE_ALL, "smb_buflen: %d\n", buflen);
 
-    ret = gpo_cache_store_file(smb_path, smb_cse_suffix, buf, buflen);
+    ret = gpo_cache_store_file(smb_path, smb_file_suffix, buf, buflen);
     if (ret != EOK) {
         DEBUG(SSSDBG_CRIT_FAILURE,
               "gpo_cache_store_file failed [%d][%s]\n",
@@ -655,7 +655,7 @@ perform_smb_operations(int cached_gpt_version,
                        const char *smb_server,
                        const char *smb_share,
                        const char *smb_path,
-                       const char *smb_cse_suffix,
+                       const char *smb_file_suffix,
                        int *_sysvol_gpt_version)
 {
     SMBCCTX *smbc_ctx;
@@ -702,7 +702,7 @@ perform_smb_operations(int cached_gpt_version,
     if (sysvol_gpt_version > cached_gpt_version) {
         /* download policy file */
         ret = copy_smb_file_to_gpo_cache(smbc_ctx, smb_server, smb_share,
-                                         smb_path, smb_cse_suffix);
+                                         smb_path, smb_file_suffix);
         if (ret != EOK) {
             DEBUG(SSSDBG_CRIT_FAILURE,
                   "copy_smb_file_to_gpo_cache failed [%d][%s]\n",
@@ -833,7 +833,7 @@ main(int argc, const char *argv[])
                                     ibuf->smb_server,
                                     ibuf->smb_share,
                                     ibuf->smb_path,
-                                    ibuf->smb_cse_suffix,
+                                    ibuf->smb_file_suffix,
                                     &sysvol_gpt_version);
     if (result != EOK) {
         DEBUG(SSSDBG_CRIT_FAILURE,
