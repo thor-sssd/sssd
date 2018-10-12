@@ -123,6 +123,10 @@ int gpo_child_debug_fd = -1;
 #define INI_GENERAL_SECTION "General"
 #define GPT_INI_VERSION "Version"
 
+/* == gpo-client constants ================================================= */
+
+#define AD_GPO_FLAGS_MASK_CLIENT 0x00000003
+
 /* == cse-security constants =============================================== */
 
 #define RIGHTS_SECTION "Privilege Rights"
@@ -1276,12 +1280,41 @@ ad_gpo_filter_gpos(TALLOC_CTX *mem_ctx,
 
         dacl = candidate_gpo->gpo_sd->dacl;
 
-        /* gpo_flags value of 2 means that GPO's computer portion is disabled */
-        if (policy_mode == AD_GP_MODE_COMPUTER &&
-            candidate_gpo->gpo_flags == 2) {
-            DEBUG(SSSDBG_TRACE_FUNC,
-                  "GPO not applicable to target per filtering: "
-                  "GPO's computer portion is disabled\n");
+        /*
+         * [MS-GPOL] 3.2.5.1.6:
+         * - gpo_flags value = 1: GPO's user portion is disabled
+         * - gpo_flags value = 2: GPO's computer portion is disabled
+         * - gpo_flags value = 3: GPO's computer and user portions are disabled
+         */
+        switch (candidate_gpo->gpo_flags & AD_GPO_FLAGS_MASK_CLIENT) {
+        case 0:
+            break;
+        case 1:
+            /*
+             * gpo_flags value of 1 means that
+             * GPO's user portion is disabled
+             */
+            if (policy_mode == AD_GP_MODE_COMPUTER) {
+                break;
+            }
+        case 2:
+            /*
+             * gpo_flags value of 2 means that
+             * GPO's computer portion is disabled
+             */
+            if (policy_mode == AD_GP_MODE_USER) {
+                break;
+            }
+        default:
+            if (policy_mode == AD_GP_MODE_COMPUTER) {
+                DEBUG(SSSDBG_TRACE_FUNC,
+                      "GPO not applicable to target per filtering: "
+                      "GPO's computer portion is disabled\n");
+            } else if (policy_mode == AD_GP_MODE_USER) {
+                DEBUG(SSSDBG_TRACE_FUNC,
+                      "GPO not applicable to target per filtering: "
+                      "GPO's user portion is disabled\n");
+            }
             continue;
         }
 
