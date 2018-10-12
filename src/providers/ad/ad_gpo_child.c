@@ -645,7 +645,6 @@ main(int argc, const char *argv[])
         DEBUG(SSSDBG_CRIT_FAILURE,
               "perform_smb_operations failed.[%d][%s].\n",
               result, strerror(result));
-        goto fail;
     }
 
     ret = prepare_response(main_ctx, result, &resp);
