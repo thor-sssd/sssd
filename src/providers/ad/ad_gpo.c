@@ -1058,6 +1058,14 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
         access_allowed = false;
         candidate_gpo = candidate_gpos[i];
 
+        /* Not all candidate GPOs in the list may have been returned due to
+         * access control or replication issues. If the GPO was not returned
+         * in the LDAP search response, the GPO GUID is NULL and the GPO must
+         * be ignored. */
+        if (candidate_gpo->gpo_guid == NULL) {
+            continue;
+        }
+
         DEBUG(SSSDBG_TRACE_FUNC, "examining dacl candidate_gpo_guid:%s\n",
               candidate_gpo->gpo_guid);
 
@@ -4218,7 +4226,9 @@ ad_gpo_missing_or_unreadable_attr(struct ad_gpo_process_gpo_state *state,
 {
     bool ignore_unreadable = dp_opt_get_bool(state->ad_options,
                                              AD_GPO_IGNORE_UNREADABLE);
-
+    /* [MS-GPOL 3.2.5.1.5]:
+     * If there are any errors in processing attribute, policy application
+     * MUST be terminated and an event logged. */
     if (ignore_unreadable) {
         /* If admins decided to skip GPOs with unreadable
          * attributes just log the SID of skipped GPO */
@@ -4270,12 +4280,32 @@ ad_gpo_sd_process_attrs(struct tevent_req *req,
     int ret;
     struct ldb_message_element *el = NULL;
     const char *gpo_guid = NULL;
+    const char *gpo_dn = NULL;
     const char *raw_file_sys_path = NULL;
     char *file_sys_path = NULL;
     uint8_t *raw_machine_ext_names = NULL;
 
     state = tevent_req_data(req, struct ad_gpo_process_gpo_state);
     gp_gpo = state->candidate_gpos[state->gpo_index];
+
+    /* [MS-GPOL 3.2.5.1.5 GPO]:
+     * If the GPO was not returned in the LDAP
+     * search response, the GPO MUST be ignored. */
+    if (result == NULL || result->num < 2) {
+        DEBUG(SSSDBG_TRACE_FUNC,
+              "candidate gpos[%d]->gpo_dn: %s\n",
+              state->gpo_index, state->candidate_gpos[state->gpo_index]->gpo_dn);
+        if (result->num == 1) {
+            ret = sysdb_attrs_get_string(result, SYSDB_ORIG_DN, &gpo_dn);
+            if (ret == EOK) {
+                DEBUG(SSSDBG_TRACE_ALL, "originalDN: %s\n", gpo_dn);
+            }
+        }
+        DEBUG(SSSDBG_TRACE_FUNC, "GPO denied. Reason: Inaccessible.\n");
+        state->gpo_index++;
+        ret = ad_gpo_get_gpo_attrs_step(req);
+        goto done;
+    }
 
     /* retrieve AD_AT_CN */
     ret = sysdb_attrs_get_string(result, AD_AT_CN, &gpo_guid);
@@ -4401,7 +4431,6 @@ ad_gpo_sd_process_attrs(struct tevent_req *req,
          */
         DEBUG(SSSDBG_TRACE_ALL,
               "machine_ext_names attribute not found or has no value\n");
-        state->gpo_index++;
     } else {
         raw_machine_ext_names = el[0].values[0].data;
 
@@ -4415,9 +4444,9 @@ ad_gpo_sd_process_attrs(struct tevent_req *req,
             goto done;
         }
 
-        state->gpo_index++;
     }
 
+    state->gpo_index++;
     ret = ad_gpo_get_gpo_attrs_step(req);
 
  done:
