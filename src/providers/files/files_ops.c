@@ -247,41 +247,6 @@ done:
     return ret;
 }
 
-static errno_t delete_all_users(struct sss_domain_info *dom)
-{
-    TALLOC_CTX *tmp_ctx;
-    struct ldb_dn *base_dn;
-    errno_t ret;
-
-    tmp_ctx = talloc_new(NULL);
-    if (tmp_ctx == NULL) {
-        DEBUG(SSSDBG_FATAL_FAILURE, "Out of memory!\n");
-        return ENOMEM;
-    }
-
-    base_dn = sysdb_user_base_dn(tmp_ctx, dom);
-    if (base_dn == NULL) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "Out of memory!\n");
-        ret = ENOMEM;
-        goto done;
-    }
-
-    ret = sysdb_delete_recursive(dom->sysdb, base_dn, true);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE, "Unable to delete users subtree [%d]: %s\n",
-              ret, sss_strerror(ret));
-        goto done;
-    }
-
-    ret = EOK;
-    DEBUG(SSSDBG_TRACE_FUNC, "All users deleted from database\n");
-
-done:
-    talloc_free(tmp_ctx);
-
-    return ret;
-}
-
 static errno_t delete_non_existing_users(struct files_id_ctx *id_ctx)
 {
     TALLOC_CTX *tmp_ctx = NULL;
@@ -599,41 +564,6 @@ static const char **get_cached_user_names(TALLOC_CTX *mem_ctx,
 done:
     /* Don't free res and keep it around to avoid duplicating the names */
     return user_names;
-}
-
-static errno_t delete_all_groups(struct sss_domain_info *dom)
-{
-    TALLOC_CTX *tmp_ctx;
-    struct ldb_dn *base_dn;
-    errno_t ret;
-
-    tmp_ctx = talloc_new(NULL);
-    if (tmp_ctx == NULL) {
-        DEBUG(SSSDBG_FATAL_FAILURE, "Out of memory!\n");
-        return ENOMEM;
-    }
-
-    base_dn = sysdb_group_base_dn(tmp_ctx, dom);
-    if (base_dn == NULL) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "Out of memory!\n");
-        ret = ENOMEM;
-        goto done;
-    }
-
-    ret = sysdb_delete_recursive(dom->sysdb, base_dn, true);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE, "Unable to delete groups subtree [%d]: %s\n",
-              ret, sss_strerror(ret));
-        goto done;
-    }
-
-    ret = EOK;
-    DEBUG(SSSDBG_TRACE_FUNC, "All groups deleted from database\n");
-
-done:
-    talloc_free(tmp_ctx);
-
-    return ret;
 }
 
 static errno_t delete_non_existing_groups(struct files_id_ctx *id_ctx)
