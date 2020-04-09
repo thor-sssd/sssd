@@ -28,15 +28,16 @@
 #include "db/sysdb_computer.h"
 
 static errno_t
-sysdb_search_computer(TALLOC_CTX *mem_ctx,
-                      struct sss_domain_info *domain,
-                      const char *filter,
-                      const char **attrs,
-                      size_t *_num_hosts,
-                      struct ldb_message ***_hosts)
+sysdb_search_computer_by_name(TALLOC_CTX *mem_ctx,
+                              struct sss_domain_info *domain,
+                              const char *name,
+                              const char **attrs,
+                              size_t *_num_hosts,
+                              struct ldb_message ***_hosts)
 {
     errno_t ret;
     TALLOC_CTX *tmp_ctx;
+    const char *filter;
     struct ldb_message **results;
     size_t num_results;
 
@@ -45,18 +46,25 @@ sysdb_search_computer(TALLOC_CTX *mem_ctx,
         return ENOMEM;
     }
 
+    filter = talloc_asprintf(tmp_ctx, SYSDB_COMP_FILTER, name);
+    if (!filter) {
+        ret = ENOMEM;
+        goto done;
+    }
+
     ret = sysdb_search_custom(tmp_ctx, domain, filter,
                               COMPUTERS_SUBDIR, attrs,
                               &num_results, &results);
-    if (ret != EOK && ret != ENOENT) {
-        DEBUG(SSSDBG_CRIT_FAILURE,
-              "Error looking up host [%d]: %s\n",
-               ret, strerror(ret));
-        goto done;
-    } else if (ret == ENOENT) {
-        DEBUG(SSSDBG_TRACE_FUNC, "No such host\n");
-        *_hosts = NULL;
-        *_num_hosts = 0;
+    if (ret != EOK) {
+        if (ret == ENOENT) {
+            DEBUG(SSSDBG_TRACE_FUNC, "No such host\n");
+            *_hosts = NULL;
+            *_num_hosts = 0;
+        } else {
+            DEBUG(SSSDBG_CRIT_FAILURE,
+                  "Error looking up host [%d]: %s\n",
+                   ret, strerror(ret));
+        }
         goto done;
     }
 
@@ -79,7 +87,6 @@ sysdb_get_computer(TALLOC_CTX *mem_ctx,
 {
     TALLOC_CTX *tmp_ctx;
     errno_t ret;
-    const char *filter;
     struct ldb_message **hosts;
     size_t num_hosts;
 
@@ -88,14 +95,9 @@ sysdb_get_computer(TALLOC_CTX *mem_ctx,
         return ENOMEM;
     }
 
-    filter = talloc_asprintf(tmp_ctx, SYSDB_COMP_FILTER, computer_name);
-    if (!filter) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    ret = sysdb_search_computer(tmp_ctx, domain, filter, attrs,
-                                &num_hosts, &hosts);
+    ret = sysdb_search_computer_by_name(tmp_ctx, domain,
+                                        computer_name, attrs,
+                                        &num_hosts, &hosts);
     if (ret != EOK) {
         goto done;
     }
@@ -120,12 +122,18 @@ int
 sysdb_set_computer(TALLOC_CTX *mem_ctx,
                    struct sss_domain_info *domain,
                    const char *computer_name,
-                   const char *sid_str,
+                   const char *dn,
+                   const char *sid,
+                   const char **group_sids,
+                   int num_groups,
                    int cache_timeout,
                    time_t now)
 {
     TALLOC_CTX *tmp_ctx;
-    int ret;
+    int ret, sret;
+    int i;
+    bool in_transaction = false;
+    struct ldb_message *msg = NULL;
     struct sysdb_attrs *attrs;
 
     tmp_ctx = talloc_new(NULL);
@@ -139,8 +147,19 @@ sysdb_set_computer(TALLOC_CTX *mem_ctx,
         goto done;
     }
 
-    ret = sysdb_attrs_add_string(attrs, SYSDB_SID_STR, sid_str);
+    ret = sysdb_attrs_add_string(attrs, SYSDB_ORIG_DN, dn);
     if (ret) goto done;
+
+    ret = sysdb_attrs_add_string(attrs, SYSDB_SID_STR, sid);
+    if (ret) goto done;
+
+    /* sysdb_store_custom(() cannot correctly modify multi-value attributes */
+    if (num_groups > 0) {
+        if (group_sids[0] != NULL) {
+            ret = sysdb_attrs_add_string(attrs, SYSDB_MEMBEROF_SID_STR, group_sids[0]);
+            if (ret) goto done;
+        }
+    }
 
     ret = sysdb_attrs_add_string(attrs, SYSDB_OBJECTCLASS, SYSDB_COMPUTER_CLASS);
     if (ret) goto done;
@@ -165,6 +184,62 @@ sysdb_set_computer(TALLOC_CTX *mem_ctx,
     ret = sysdb_store_custom(domain, computer_name, COMPUTERS_SUBDIR, attrs);
     if (ret) goto done;
 
+    /* Add remaining computer groups */
+    for (i=1; i<num_groups; i++) {
+        if (group_sids[i] != NULL) {
+            if (!msg) {
+                ret = sysdb_transaction_start(domain->sysdb);
+                if (ret) {
+                    goto done;
+                }
+                in_transaction = true;
+                msg = ldb_msg_new(tmp_ctx);
+                if (!msg) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+                msg->dn = sysdb_custom_dn(tmp_ctx, domain,
+                                          computer_name, COMPUTERS_SUBDIR);
+                if (!msg->dn) {
+                    DEBUG(SSSDBG_CRIT_FAILURE, "sysdb_custom_dn failed.\n");
+                    ret = ENOMEM;
+                    goto done;
+                }
+                ret = ldb_msg_add_empty(msg,
+                                        SYSDB_MEMBEROF_SID_STR,
+                                        LDB_FLAG_MOD_ADD,
+                                        NULL);
+                if (ret != LDB_SUCCESS) {
+                    ret = sysdb_error_to_errno(ret);
+                    goto done;
+                }
+            }
+            ret = ldb_msg_add_string(msg,
+                                     SYSDB_MEMBEROF_SID_STR, group_sids[i]);
+            if (ret != LDB_SUCCESS) {
+                ret = sysdb_error_to_errno(ret);
+                goto done;
+            }
+        }
+    }
+    if (msg) {
+        ret = ldb_modify(domain->sysdb->ldb, msg);
+        if (ret != LDB_SUCCESS) {
+            DEBUG(SSSDBG_MINOR_FAILURE,
+                  "ldb_modify failed: [%s](%d)[%s]\n",
+                  ldb_strerror(ret), ret, ldb_errstring(domain->sysdb->ldb));
+            ret = sysdb_error_to_errno(ret);
+            goto done;
+        }
+        ret = sysdb_transaction_commit(domain->sysdb);
+        if (ret != EOK) {
+            DEBUG(SSSDBG_CRIT_FAILURE,
+                  "Could not commit transaction: [%s]\n", strerror(ret));
+            goto done;
+        }
+        in_transaction = false;
+    }
+
     /* FIXME As a future improvement we have to extend domain enumeration.
      * When 'enumerate = true' for a domain, sssd starts a periodic task
      * that brings all users and groups to the cache, cleaning up
@@ -176,8 +251,14 @@ sysdb_set_computer(TALLOC_CTX *mem_ctx,
      * enumeration task for the  id provider).
      */
 done:
+    if (in_transaction) {
+        sret = sysdb_transaction_cancel(domain->sysdb);
+        if (sret != EOK) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "Could not cancel transaction\n");
+        }
+    }
     if (ret) {
-        DEBUG(SSSDBG_TRACE_FUNC, "Error: %d (%s)\n", ret, strerror(ret));
+        DEBUG(SSSDBG_MINOR_FAILURE, "Error: %d (%s)\n", ret, strerror(ret));
     }
     talloc_zfree(tmp_ctx);
 

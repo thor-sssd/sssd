@@ -32,6 +32,7 @@
 #define SYSDB_TMPL_COMPUTER_BASE    SYSDB_COMPUTERS_CONTAINER","SYSDB_DOM_BASE
 #define SYSDB_TMPL_COMPUTER         SYSDB_NAME"=%s,"SYSDB_TMPL_COMPUTER_BASE
 #define SYSDB_COMP_FILTER           "(&("SYSDB_NAME"=%s)("SYSDB_OBJECTCLASS"="SYSDB_COMPUTER_CLASS"))"
+#define SYSDB_MEMBEROF_SID_STR      "memberOfSIDString"
 
 int
 sysdb_get_computer(TALLOC_CTX *mem_ctx,
@@ -44,7 +45,10 @@ int
 sysdb_set_computer(TALLOC_CTX *mem_ctx,
                    struct sss_domain_info *domain,
                    const char *computer_name,
-                   const char *sid_str,
+                   const char *dn,
+                   const char *sid,
+                   const char **group_sids,
+                   int num_groups,
                    int cache_timeout,
                    time_t now);
 

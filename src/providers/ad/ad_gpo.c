@@ -60,6 +60,7 @@
 #include "util/util_sss_idmap.h"
 #include <ndr.h>
 #include <gen_ndr/security.h>
+#include <db/sysdb_computer.h>
 
 /* == gpo-ldap constants =================================================== */
 
@@ -2006,6 +2007,7 @@ struct ad_gpo_access_state {
     struct sss_domain_info *user_domain;
     struct sss_domain_info *host_domain;
     const char *user;
+    const char *hostname;
     const char *cse_guid;
     struct gp_gpo **security_cse_gpos;
     int num_security_cse_gpos;
@@ -2129,13 +2131,13 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
 
     /* SDAP_SASL_AUTHID contains the name used for kinit and SASL bind which
      * in the AD case is the NetBIOS name. */
-    sam_account_name = dp_opt_get_string(state->opts->basic, SDAP_SASL_AUTHID);
-    if (sam_account_name == NULL) {
+    state->hostname = dp_opt_get_string(state->opts->basic, SDAP_SASL_AUTHID);
+    if (state->hostname == NULL) {
         ret = ENOMEM;
         goto immediately;
     }
     DEBUG(SSSDBG_TRACE_FUNC,
-          "policy target SAM account name is %s\n", sam_account_name);
+          "Policy target SAM account name is %s\n", state->hostname);
 
     subreq = ad_gpo_core_send(state,
                               state->ev,
@@ -2143,7 +2145,7 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
                               state->access_ctx->ad_options,
                               state->access_ctx->ad_id_ctx,
                               state->opts,
-                              sam_account_name,
+                              state->hostname,
                               state->policy_mode,
                               state->cse_guid);
     if (subreq == NULL) {
@@ -2199,12 +2201,15 @@ process_offline_gpos(TALLOC_CTX *mem_ctx,
 static void
 ad_gpo_connect_done(struct tevent_req *subreq)
 {
+    TALLOC_CTX *tmp_ctx = NULL;
     struct tevent_req *req;
     struct ad_gpo_core_state *state;
     int dp_error;
     errno_t ret;
     char *server_uri;
     LDAPURLDesc *lud;
+    time_t expiration_time;
+    int i;
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_core_state);
@@ -2253,6 +2258,129 @@ ad_gpo_connect_done(struct tevent_req *subreq)
     DEBUG(SSSDBG_TRACE_ALL, "server_hostname from uri: %s\n",
           state->server_hostname);
 
+    if (state->policy_mode == AD_GP_MODE_COMPUTER) {
+        /* Get the cached computer object by computer name */
+        const char *host_attrs[] = {SYSDB_ORIG_DN, SYSDB_SID_STR,
+                                    SYSDB_MEMBEROF_SID_STR,
+                                    SYSDB_CACHE_EXPIRE, NULL};
+        struct ldb_message *msg;
+        struct ldb_message_element *host_memberOf;
+        const char *host_dn = NULL;
+        const char *host_sid = NULL;
+        int lret;
+
+        tmp_ctx = talloc_new(NULL);
+        if (tmp_ctx == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        lret = sysdb_get_computer(tmp_ctx,
+                                  state->policy_target_domain,
+                                  state->policy_target_name,
+                                  host_attrs, &msg);
+        if (lret != EOK && lret != ENOENT) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "sysdb_get_computer failed: [%d](%s)\n",
+                  lret, sss_strerror(lret));
+            ret = lret;
+            goto done;
+        }
+        /* Configuration settings may have prevented SSSD from clening up
+         * the expired computer cache object */
+        if (lret == EOK) {
+            expiration_time = ldb_msg_find_attr_as_uint64(msg,
+                                                          SYSDB_CACHE_EXPIRE, 0);
+            if (expiration_time < time(NULL)) {
+                lret = ERR_ACCOUNT_EXPIRED;
+            }
+        }
+        if (lret == EOK) {
+            /* Get the computer DN, SID and groups from the cached entry */
+            host_dn = ldb_msg_find_attr_as_string(msg, SYSDB_ORIG_DN, NULL);
+            if (host_dn == NULL) {
+                DEBUG(SSSDBG_CRIT_FAILURE,
+                      "%s is missing from message [%s]\n",
+                      SYSDB_ORIG_DN, ldb_dn_get_linearized(msg->dn));
+                ret = EINVAL;
+                goto done;
+            }
+            host_sid = ldb_msg_find_attr_as_string(msg, SYSDB_SID_STR, NULL);
+            if (host_sid == NULL) {
+                DEBUG(SSSDBG_CRIT_FAILURE,
+                      "%s is missing from message [%s]\n",
+                      SYSDB_SID_STR, ldb_dn_get_linearized(msg->dn));
+                ret = EINVAL;
+                goto done;
+            }
+            host_memberOf = ldb_msg_find_element(msg, SYSDB_MEMBEROF_SID_STR);
+            if (!host_memberOf || host_memberOf->num_values == 0) {
+                DEBUG(SSSDBG_CRIT_FAILURE,
+                      "%s is missing from message [%s]\n",
+                      SYSDB_MEMBEROF_SID_STR, ldb_dn_get_linearized(msg->dn));
+                ret = EINVAL;
+                goto done;
+            }
+            state->target = talloc_zero(state, struct gp_target);
+            if (state->target == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+            state->target->dn = talloc_steal(state->target, host_dn);
+            if (state->target->dn == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+            state->target->sid = talloc_steal(state->target, host_sid);
+            if (state->target->sid == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+            state->target->num_groups = host_memberOf->num_values;
+            state->target->group_sids = talloc_array(state->target,
+                                                     const char *,
+                                                     state->target->num_groups + 1);
+            if (state->target->group_sids == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+            for (i = 0; i < state->target->num_groups; i++) {
+                state->target->group_sids[i] =
+                    talloc_steal(state->target,
+                                 (char *)host_memberOf->values[i].data);
+                if (state->target->group_sids[i] == NULL) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+            }
+
+            DEBUG(SSSDBG_FUNC_DATA,
+                    "Using policy target attributes from cache [%s]\n",
+                    state->policy_target_name);
+
+            subreq = ad_gpo_process_som_send(state,
+                                             state->ev,
+                                             state->conn,
+                                             state->ldb_ctx,
+                                             state->sdap_op,
+                                             state->opts,
+                                             state->timeout,
+                                             dp_opt_get_string(state->ad_options, AD_SITE),
+                                             state->target->dn,
+                                             state->policy_target_domain->name);
+            if (subreq == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+            tevent_req_set_callback(subreq, ad_gpo_process_som_done, req);
+            ret = EOK;
+            goto done;
+        } else {
+            DEBUG(SSSDBG_FUNC_DATA,
+                  "Policy target attributes not in cache or expired [%s]\n",
+                  state->policy_target_name);
+        }
+    }
+
     subreq = ad_gpo_process_target_send(state,
                                         state->ev,
                                         state->sdap_op,
@@ -2271,6 +2399,9 @@ ad_gpo_connect_done(struct tevent_req *subreq)
 
  done:
 
+    if (tmp_ctx != NULL) {
+        talloc_free(tmp_ctx);
+    }
     if (ret != EOK) {
         tevent_req_error(req, ret);
     }
@@ -3680,6 +3811,7 @@ ad_gpo_target_attrs_retrieval_done(struct tevent_req *subreq)
         goto done;
     }
 
+    // Retrieve step-by-step missing SID or DN for the policy target's groups
     ret = ad_gpo_get_target_sids_step(req);
 
  done:
@@ -3793,6 +3925,7 @@ ad_gpo_get_target_sids_step(struct tevent_req *req)
 static void
 ad_gpo_get_target_sids_done(struct tevent_req *subreq)
 {
+    TALLOC_CTX *tmp_ctx = NULL;
     struct tevent_req *req;
     struct ad_gpo_process_target_state *state;
     struct gp_group *target_group;
@@ -3804,6 +3937,7 @@ ad_gpo_get_target_sids_done(struct tevent_req *subreq)
     char *group_sid = NULL;
     const char *group_dn = NULL;
     enum idmap_error_code err;
+    int i;
 
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
@@ -3890,10 +4024,85 @@ ad_gpo_get_target_sids_done(struct tevent_req *subreq)
           state->group_index, target_group->group_dn);
 
     state->group_index++;
+
     ret = ad_gpo_get_target_sids_step(req);
+
+    if (ret == EOK) {
+        /* Store computer SIDs in cache to avoid querying LDAP again and again
+         * for user access control.
+         */
+        if (state->target_object == AD_GP_TARGET_COMPUTER) {
+            struct gp_group **target_groups;
+            const char **group_sids = NULL;
+            int group_size = 0;
+            int lret;
+
+            // Duplicate as ad_gpo_populate_target_group_list() steals memory
+            tmp_ctx = talloc_new(NULL);
+            if (tmp_ctx == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+            target_groups = talloc_array(tmp_ctx,
+                                         struct gp_group *,
+                                         state->num_target_groups + 1);
+            if (target_groups == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+            for (i=0; i<state->num_target_groups; i++) {
+                target_groups[i] = talloc_zero(target_groups,
+                                               struct gp_group);
+                if (target_groups[i] == NULL) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+                target_group = target_groups[i];
+                target_group->group_sid =
+                    talloc_strdup(target_group, state->target_groups[i]->group_sid);
+                if (target_group->group_sid == NULL) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+            }
+            lret = ad_gpo_populate_target_group_list(tmp_ctx,
+                                                     target_groups,
+                                                     state->num_target_groups,
+                                                     &group_sids,
+                                                     &group_size);
+            if (lret != EOK) {
+                DEBUG(SSSDBG_MINOR_FAILURE,
+                      "Unable to populate target group list for cache: [%d](%s)\n",
+                      ret, sss_strerror(ret));
+                ret = lret;
+                goto done;
+            }
+            lret = sysdb_set_computer(req, state->target_domain,
+                                      state->target_name,
+                                      state->target_dn, state->target_sid,
+                                      group_sids, group_size,
+                                      state->target_domain->computer_timeout,
+                                      time(NULL));
+            if (lret != EOK) {
+                DEBUG(SSSDBG_MINOR_FAILURE,
+                      "sysdb_set_computer failed: [%d](%s)\n",
+                       ret, sss_strerror(ret));
+                if (lret == ENOMEM) {
+                    ret = lret;
+                }
+            } else {
+                DEBUG(SSSDBG_FUNC_DATA,
+                      "Policy target attributes stored in cache [%s]\n",
+                      state->target_dn);
+            }
+        }
+    }
 
  done:
 
+    if (tmp_ctx != NULL) {
+        talloc_free(tmp_ctx);
+    }
     if (ret == EOK) {
         tevent_req_done(req);
     } else if (ret != EAGAIN) {
