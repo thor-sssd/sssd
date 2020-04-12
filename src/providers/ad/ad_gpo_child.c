@@ -1,7 +1,7 @@
 /*
     SSSD
 
-    AD GPO Backend Module -- perform SMB and CSE processing in a child process
+    AD GPO Backend Module -- perform SMB processing in a child process
 
     Authors:
         Yassir Elley <yelley@redhat.com>
@@ -28,7 +28,6 @@
 #include <sys/stat.h>
 #include <popt.h>
 #include <libsmbclient.h>
-#include <ini_configobj.h>
 #include <security/pam_modules.h>
 
 #include "util/util.h"
@@ -37,13 +36,7 @@
 #include "providers/ad/ad_gpo.h"
 #include "sss_cli.h"
 
-#define SMB_BUFFER_SIZE 65536
-#define GPT_INI "/GPT.INI"
-#define INI_GENERAL_SECTION "General"
-#define GPT_INI_VERSION "Version"
-
 struct input_buffer {
-    int cached_gpt_version;
     const char *smb_server;
     const char *smb_share;
     const char *smb_path;
@@ -57,12 +50,6 @@ unpack_buffer(uint8_t *buf,
 {
     size_t p = 0;
     uint32_t len;
-    uint32_t cached_gpt_version;
-
-    /* cached_gpt_version */
-    SAFEALIGN_COPY_UINT32_CHECK(&cached_gpt_version, buf + p, size, &p);
-    DEBUG(SSSDBG_TRACE_FUNC, "cached_gpt_version: %d\n", cached_gpt_version);
-    ibuf->cached_gpt_version = cached_gpt_version;
 
     /* smb_server */
     SAFEALIGN_COPY_UINT32_CHECK(&len, buf + p, size, &p);
@@ -122,16 +109,14 @@ unpack_buffer(uint8_t *buf,
 
 static errno_t
 pack_buffer(struct response *r,
-            int sysvol_gpt_version,
             int result)
 {
     size_t p = 0;
 
     /* A buffer with the following structure must be created:
-     *   uint32_t sysvol_gpt_version (required)
      *   uint32_t status of the request (required)
      */
-    r->size = 2 * sizeof(uint32_t);
+    r->size = 1 * sizeof(uint32_t);
 
     r->buf = talloc_array(r, uint8_t, r->size);
     if(r->buf == NULL) {
@@ -139,9 +124,6 @@ pack_buffer(struct response *r,
     }
 
     DEBUG(SSSDBG_TRACE_FUNC, "result [%d]\n", result);
-
-    /* sysvol_gpt_version */
-    SAFEALIGN_SET_UINT32(&r->buf[p], sysvol_gpt_version, &p);
 
     /* result */
     SAFEALIGN_SET_UINT32(&r->buf[p], result, &p);
@@ -151,7 +133,6 @@ pack_buffer(struct response *r,
 
 static errno_t
 prepare_response(TALLOC_CTX *mem_ctx,
-                 int sysvol_gpt_version,
                  int result,
                  struct response **rsp)
 {
@@ -166,7 +147,7 @@ prepare_response(TALLOC_CTX *mem_ctx,
     r->buf = NULL;
     r->size = 0;
 
-    ret = pack_buffer(r, sysvol_gpt_version, result);
+    ret = pack_buffer(r, result);
     if (ret != EOK) {
         DEBUG(SSSDBG_CRIT_FAILURE, "pack_buffer failed\n");
         return ret;
@@ -386,138 +367,6 @@ static errno_t gpo_cache_store_file(const char *smb_path,
     return ret;
 }
 
-static errno_t
-parse_ini_file_with_libini(struct ini_cfgobj *ini_config,
-                           int *_gpt_version)
-{
-    int ret;
-    struct value_obj *vobj = NULL;
-    int gpt_version;
-
-    ret = ini_get_config_valueobj(INI_GENERAL_SECTION, GPT_INI_VERSION,
-                                  ini_config, INI_GET_FIRST_VALUE, &vobj);
-    if (ret != 0) {
-        DEBUG(SSSDBG_CRIT_FAILURE,
-              "ini_get_config_valueobj failed [%d][%s]\n", ret, strerror(ret));
-        goto done;
-    }
-    if (vobj == NULL) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "section/name not found: [%s][%s]\n",
-              INI_GENERAL_SECTION, GPT_INI_VERSION);
-        ret = EINVAL;
-        goto done;
-    }
-
-    gpt_version = ini_get_int32_config_value(vobj, 0, -1, &ret);
-    if (ret != 0) {
-        DEBUG(SSSDBG_CRIT_FAILURE,
-              "ini_get_int32_config_value failed [%d][%s]\n",
-              ret, strerror(ret));
-        goto done;
-    }
-
-    *_gpt_version = gpt_version;
-
-    ret = EOK;
-
- done:
-
-    return ret;
-}
-
-/*
- * This function parses the GPT_INI file stored in the gpo_cache, and uses the
- * results to populate the output parameters ...
- */
-static errno_t
-ad_gpo_parse_ini_file(const char *smb_path,
-                      int *_gpt_version)
-{
-    struct ini_cfgfile *file_ctx = NULL;
-    struct ini_cfgobj *ini_config = NULL;
-    const char *ini_filename;
-    int ret;
-    int gpt_version = -1;
-    TALLOC_CTX *tmp_ctx = NULL;
-
-    tmp_ctx = talloc_new(NULL);
-    if (tmp_ctx == NULL) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    ini_filename = talloc_asprintf(tmp_ctx, GPO_CACHE_PATH"%s%s",
-                                   smb_path, GPT_INI);
-    if (ini_filename == NULL) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "talloc_asprintf failed.\n");
-        ret = ENOMEM;
-        goto done;
-    }
-
-    DEBUG(SSSDBG_TRACE_FUNC, "ini_filename:%s\n", ini_filename);
-
-    ret = ini_config_create(&ini_config);
-    if (ret != 0) {
-        DEBUG(SSSDBG_CRIT_FAILURE,
-              "ini_config_create failed [%d][%s]\n", ret, strerror(ret));
-        goto done;
-    }
-
-    ret = ini_config_file_open(ini_filename, 0, &file_ctx);
-    if (ret != 0) {
-        DEBUG(SSSDBG_CRIT_FAILURE,
-              "ini_config_file_open failed [%d][%s]\n", ret, strerror(ret));
-        goto done;
-    }
-
-    ret = ini_config_parse(file_ctx, INI_STOP_ON_NONE, 0, 0, ini_config);
-    if (ret != 0) {
-        int lret;
-        char **errors;
-
-        DEBUG(SSSDBG_CRIT_FAILURE,
-              "[%s]: ini_config_parse failed [%d][%s]\n",
-              ini_filename, ret, strerror(ret));
-
-        /* Now get specific errors if there are any */
-        lret = ini_config_get_errors(ini_config, &errors);
-        if (lret != 0) {
-            DEBUG(SSSDBG_CRIT_FAILURE,
-                  "Failed to get specific parse error [%d][%s]\n", lret,
-                  strerror(lret));
-            goto done;
-        }
-
-        for (int i = 0; errors[i]; i++) {
-             DEBUG(SSSDBG_CRIT_FAILURE, "%s\n", errors[i]);
-        }
-        ini_config_free_errors(errors);
-
-        goto done;
-    }
-
-    ret = parse_ini_file_with_libini(ini_config, &gpt_version);
-    if (ret != 0) {
-        DEBUG(SSSDBG_CRIT_FAILURE,
-              "parse_ini_file_with_libini failed [%d][%s]\n",
-              ret, strerror(ret));
-        goto done;
-    }
-
-    *_gpt_version = gpt_version;
-
- done:
-
-    if (ret != EOK) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "Error encountered: %d.\n", ret);
-    }
-
-    ini_config_file_destroy(file_ctx);
-    ini_config_destroy(ini_config);
-    talloc_free(tmp_ctx);
-    return ret;
-}
-
 /*
  * This function uses the input smb uri components to download a sysvol file
  * (e.g. INI file, policy file, etc) and store it to the GPO_CACHE directory.
@@ -630,37 +479,20 @@ copy_smb_file_to_gpo_cache(SMBCCTX *smbc_ctx,
 
 
 /*
- * Using its smb_uri components and cached_gpt_version inputs, this function
- * does several things:
- * - it downloads the GPT_INI file to GPO_CACHE
- * - it parses the sysvol_gpt_version field from the GPT_INI file
- * - if the sysvol_gpt_version is greater than the cached_gpt_version
- *   - it downloads the policy file to GPO_CACHE
- * - else
- *   - it doesn't retrieve the policy file
- *   - in this case, the backend will use the existing policy file in GPO_CACHE
- * - it returns the sysvol_gpt_version in the _sysvol_gpt_version output param
- *
- * Note that if the cached_gpt_version sent by the backend is -1 (to indicate
- * that no gpt_version has been set in the cache for the corresponding gpo_guid),
- * then the parsed sysvol_gpt_version (which must be at least 0) will be greater
- * than the cached_gpt_version, thereby triggering a fresh download.
+ * Using its smb_uri components this function downloads the policy file
+ * to GPO_CACHE
  *
  * Note that the backend will later do the following:
- * - backend will save the sysvol_gpt_version to sysdb cache
  * - backend will read the policy file from the GPO_CACHE
  */
 static errno_t
-perform_smb_operations(int cached_gpt_version,
-                       const char *smb_server,
+perform_smb_operations(const char *smb_server,
                        const char *smb_share,
                        const char *smb_path,
-                       const char *smb_file_suffix,
-                       int *_sysvol_gpt_version)
+                       const char *smb_file_suffix)
 {
     SMBCCTX *smbc_ctx;
     int ret;
-    int sysvol_gpt_version;
 
     smbc_ctx = smbc_new_context();
     if (smbc_ctx == NULL) {
@@ -680,38 +512,15 @@ perform_smb_operations(int cached_gpt_version,
         goto done;
     }
 
-    /* download ini file */
-    ret = copy_smb_file_to_gpo_cache(smbc_ctx, smb_server, smb_share, smb_path,
-                                     GPT_INI);
+    /* download policy file */
+    ret = copy_smb_file_to_gpo_cache(smbc_ctx, smb_server, smb_share,
+                                     smb_path, smb_file_suffix);
     if (ret != EOK) {
         DEBUG(SSSDBG_CRIT_FAILURE,
               "copy_smb_file_to_gpo_cache failed [%d][%s]\n",
               ret, strerror(ret));
         goto done;
     }
-
-    ret = ad_gpo_parse_ini_file(smb_path, &sysvol_gpt_version);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_CRIT_FAILURE,
-              "Cannot parse ini file: [%d][%s]\n", ret, strerror(ret));
-        goto done;
-    }
-
-    DEBUG(SSSDBG_TRACE_FUNC, "sysvol_gpt_version: %d\n", sysvol_gpt_version);
-
-    if (sysvol_gpt_version > cached_gpt_version) {
-        /* download policy file */
-        ret = copy_smb_file_to_gpo_cache(smbc_ctx, smb_server, smb_share,
-                                         smb_path, smb_file_suffix);
-        if (ret != EOK) {
-            DEBUG(SSSDBG_CRIT_FAILURE,
-                  "copy_smb_file_to_gpo_cache failed [%d][%s]\n",
-                  ret, strerror(ret));
-            goto done;
-        }
-    }
-
-    *_sysvol_gpt_version = sysvol_gpt_version;
 
  done:
     smbc_free_context(smbc_ctx, 0);
@@ -726,7 +535,6 @@ main(int argc, const char *argv[])
     int debug_fd = -1;
     const char *opt_logger = NULL;
     errno_t ret;
-    int sysvol_gpt_version;
     int result;
     TALLOC_CTX *main_ctx = NULL;
     uint8_t *buf = NULL;
@@ -829,12 +637,10 @@ main(int argc, const char *argv[])
 
     DEBUG(SSSDBG_TRACE_FUNC, "performing smb operations\n");
 
-    result = perform_smb_operations(ibuf->cached_gpt_version,
-                                    ibuf->smb_server,
+    result = perform_smb_operations(ibuf->smb_server,
                                     ibuf->smb_share,
                                     ibuf->smb_path,
-                                    ibuf->smb_file_suffix,
-                                    &sysvol_gpt_version);
+                                    ibuf->smb_file_suffix);
     if (result != EOK) {
         DEBUG(SSSDBG_CRIT_FAILURE,
               "perform_smb_operations failed.[%d][%s].\n",
@@ -842,7 +648,7 @@ main(int argc, const char *argv[])
         goto fail;
     }
 
-    ret = prepare_response(main_ctx, sysvol_gpt_version, result, &resp);
+    ret = prepare_response(main_ctx, result, &resp);
     if (ret != EOK) {
         DEBUG(SSSDBG_CRIT_FAILURE, "prepare_response failed. [%d][%s].\n",
                     ret, strerror(ret));
