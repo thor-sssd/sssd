@@ -6286,6 +6286,7 @@ ad_gpo_get_gpt_file_done(struct tevent_req *subreq)
     if (filtered_gpo->send_to_child) {
         ret = sysdb_gpo_store_gpo(state->policy_target_domain,
                                   gpo_guid,
+                                  filtered_gpo->gpo_dn,
                                   filtered_gpo->gpo_container_version,
                                   sysvol_gpt_version,
                                   state->gpo_timeout_option, now);

@@ -28,11 +28,12 @@
 
 #define COMPUTERS_SUBDIR            "computers"
 #define SYSDB_COMPUTER_CLASS        "computer"
-#define SYSDB_COMPUTERS_CONTAINER   "cn="COMPUTERS_SUBDIR
+#define SYSDB_COMPUTERS_CONTAINER   "cn="COMPUTERS_SUBDIR","SYSDB_CUSTOM_CONTAINER
 #define SYSDB_TMPL_COMPUTER_BASE    SYSDB_COMPUTERS_CONTAINER","SYSDB_DOM_BASE
 #define SYSDB_TMPL_COMPUTER         SYSDB_NAME"=%s,"SYSDB_TMPL_COMPUTER_BASE
 #define SYSDB_COMP_FILTER           "(&("SYSDB_NAME"=%s)("SYSDB_OBJECTCLASS"="SYSDB_COMPUTER_CLASS"))"
 #define SYSDB_MEMBEROF_SID_STR      "memberOfSIDString"
+#define SYSDB_GPLINK_STR            "gPLink"
 
 int
 sysdb_get_computer(TALLOC_CTX *mem_ctx,
@@ -51,5 +52,11 @@ sysdb_set_computer(TALLOC_CTX *mem_ctx,
                    int num_groups,
                    int cache_timeout,
                    time_t now);
+
+errno_t
+sysdb_computer_setgplinks(struct sss_domain_info *domain,
+                          const char *computer_name,
+                          const char **cached_gpo_dn_list,
+                          int num_cached_gpo_dns);
 
 #endif /* SYSDB_COMPUTERS_H_ */
