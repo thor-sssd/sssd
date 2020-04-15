@@ -23,6 +23,7 @@
 /*
  * This file implements the following pair of *public* functions (see header):
  *   ad_gpo_access_send/recv: provides client-side GPO processing
+ *   ad_gpo_parse_map_options: parse map options for security GPO processing
  *
  * This file also implements the following pairs of *private* functions (which
  * are used by the public functions):
@@ -114,6 +115,10 @@ int gpo_child_debug_fd = -1;
 #define AD_INT_GPO_VERSION ad_gpo_container_gpo_version
 #define AD_GPO_SYSVOL_VERSION_MASK 0xFFFF0000
 #define AD_GPO_AD_VERSION_MASK 0x0000FFFF
+
+/* [MS-GPOL] 3.2.1.17 and 3.2.1.20 */
+#define AD_GPO_DEFAULT_REFRESH_INTERVAL 5400
+#define AD_GPO_DEFAULT_REFRESH_MAX_OFFSET 1800
 
 #define INI_GENERAL_SECTION "General"
 #define GPT_INI_VERSION "Version"
@@ -311,6 +316,85 @@ ad_gpo_cache_file_send(TALLOC_CTX *mem_ctx,
                        const char *smb_path,
                        const char *smb_file_suffix);
 int ad_gpo_cache_file_recv(struct tevent_req *req);
+
+/* == common gpo-version helpers ============================================*/
+
+const char *ad_gpo_strmode(enum ad_gp_application_modes policy_mode)
+{
+    return gp_mode_to_str[policy_mode].msg;
+}
+
+/* [MS-GPOL] 2.2.4
+ * Get version number of the changes for the computer or the user policy
+ * portion of a GPO depending on the policy application mode (scope)
+ */
+int
+ad_gpo_scopealign_gpo_version(int gpo_version,
+                              enum ad_gp_application_modes policy_mode)
+{
+    int scopealigned_version = -1;
+
+    if (gpo_version == -1) {
+        return scopealigned_version;
+    }
+
+    if (policy_mode == AD_GP_MODE_USER) {
+        scopealigned_version = gpo_version & AD_GPO_USER_VERSION_MASK;
+        scopealigned_version >>= 16;
+    } else if (policy_mode == AD_GP_MODE_COMPUTER) {
+        scopealigned_version = gpo_version & AD_GPO_MACHINE_VERSION_MASK;
+    }
+
+    return scopealigned_version;
+}
+
+/* [MS-GPOL] 3.2.1.4:
+ * Combine version number of the changes for AD and SYSVOL policy portion
+ * of a GPO into a combined GPO versions number */
+int
+ad_gpo_combine_gpo_versions(int container_gpo_version,
+                            int file_system_gpo_version)
+{
+    int gpo_version = -1;
+
+    if (container_gpo_version < 0 || file_system_gpo_version < 0) {
+        return gpo_version;
+    }
+
+    gpo_version = file_system_gpo_version << 16;
+    gpo_version |= container_gpo_version;
+
+    return gpo_version;
+}
+
+/* Get version number of the changes for SYSVOL policy portion of a GPO */
+int ad_gpo_file_system_gpo_version(int gpo_version)
+{
+    int sysvol_version = -1;
+
+    if (gpo_version == -1) {
+        return sysvol_version;
+    }
+
+    sysvol_version = gpo_version & AD_GPO_SYSVOL_VERSION_MASK;
+    sysvol_version >>= 16;
+
+    return sysvol_version;
+}
+
+/* Get version number of the changes for AD policy portion of a GPO */
+int ad_gpo_container_gpo_version(int gpo_version)
+{
+    int ad_version = -1;
+
+    if (gpo_version == -1) {
+        return ad_version;
+    }
+
+    ad_version = gpo_version & AD_GPO_AD_VERSION_MASK;
+
+    return ad_version;
+}
 
 /* == ad_gpo_parse_map_options and helpers ==================================*/
 
@@ -2495,6 +2579,7 @@ ad_gpo_access_recv(struct tevent_req *req)
 /* == ad_gpo_cse_security_send/recv implementation ========================= */
 struct ad_gpo_cse_security_state {
     struct tevent_context *ev;
+    unsigned int ro_seed;
     enum ad_gp_application_modes policy_mode;
     struct sss_domain_info *host_domain;
     const char *cse_guid;
@@ -2535,6 +2620,7 @@ ad_gpo_cse_security_send(TALLOC_CTX *mem_ctx,
     }
 
     state->ev = ev;
+    state->ro_seed = time(NULL) * getpid();
     state->policy_mode = policy_mode;
     state->host_domain = host_domain;
     state->cse_guid = talloc_strdup(state, cse_guid);
@@ -2587,13 +2673,12 @@ ad_gpo_cse_security_step(struct tevent_req *req)
     struct ldb_result *res;
     errno_t ret;
     bool send_to_child = false;
-    int cached_gpo_version = 0;
-    int cached_cse_file_version = 0;
+    int gpo_version = -1;
+    int cached_security_cse_versions = -1;
     time_t policy_file_timeout = 0;
     int i;
 
     const char *cse_attrs[] = SYSDB_CSE_ATTRS;
-    const char *gpo_attrs[] = {SYSDB_GPO_SYSVOL_VERSION_ATTR, NULL};
 
     state = tevent_req_data(req, struct ad_gpo_cse_security_state);
 
@@ -2626,7 +2711,7 @@ ad_gpo_cse_security_step(struct tevent_req *req)
     }
 
     /* retrieve gpo cache entry;
-     * set cached_cse_file_version to -1 if unavailable */
+     * set cached_security_cse_versions to -1 if unavailable */
     DEBUG(SSSDBG_TRACE_FUNC, "Retrieving GPO version from cache [%s]\n",
           security_cse_gpo->gpo_guid);
     ret = sysdb_gpo_get_cse_by_guid(state,
@@ -2636,34 +2721,37 @@ ad_gpo_cse_security_step(struct tevent_req *req)
                                     cse_attrs,
                                     &res);
     if (ret == EOK) {
-        cached_cse_file_version =
+        cached_security_cse_versions =
             ldb_msg_find_attr_as_int(res->msgs[0],
                                      SYSDB_CSE_VERSION_ATTR, 0);
         policy_file_timeout =
             ldb_msg_find_attr_as_uint64(res->msgs[0],
-                                        SYSDB_GPO_TIMEOUT_ATTR, 0);
-        ret = sysdb_gpo_get_gpo_by_guid(state,
-                                        state->host_domain,
-                                        security_cse_gpo->gpo_guid,
-                                        gpo_attrs,
-                                        &res);
-        if (ret == EOK) {
-            cached_gpo_version =
-                ldb_msg_find_attr_as_int(res->msgs[0],
-                                         SYSDB_GPO_SYSVOL_VERSION_ATTR, 0);
-            if (cached_gpo_version > cached_cse_file_version) {
+                                        SYSDB_CSE_TIMEOUT_ATTR, 0);
+        if (policy_file_timeout < time(NULL)) {
+            send_to_child = true;
+        } else {
+            gpo_version =
+                SCOPEALIGN_INT_GPO_VERSION(security_cse_gpo->gpo_file_system_version,
+                                           state->policy_mode);
+            gpo_version <<= 16;
+            gpo_version |=
+                SCOPEALIGN_INT_GPO_VERSION(security_cse_gpo->gpo_container_version,
+                                           state->policy_mode);
+            /* [MS-GPOL] 3.2.1.1: Only download policy file, if GPO version has
+               changed */
+            if ((SYSVOL_INT_GPO_VERSION(gpo_version) >
+                 SYSVOL_INT_GPO_VERSION(cached_security_cse_versions)) ||
+                (AD_INT_GPO_VERSION(gpo_version) >
+                 AD_INT_GPO_VERSION(cached_security_cse_versions))) {
                 send_to_child = true;
             }
         }
-        if (policy_file_timeout < time(NULL)) {
-            send_to_child = true;
-        }
     }
-    if (ret != EOK && ret == ENOENT) {
+    else if (ret == ENOENT) {
         DEBUG(SSSDBG_TRACE_FUNC, "ENOENT\n");
-        cached_cse_file_version = -1;
+        cached_security_cse_versions = -1;
         send_to_child = true;
-    } else if (ret != ENOENT){
+    } else {
         DEBUG(SSSDBG_FATAL_FAILURE, "Could not read GPO from cache: [%s]\n",
               sss_strerror(ret));
         return ret;
@@ -2671,8 +2759,9 @@ ad_gpo_cse_security_step(struct tevent_req *req)
 
     DEBUG(SSSDBG_TRACE_FUNC, "send_to_child: %d\n", send_to_child);
     DEBUG(SSSDBG_TRACE_FUNC,
-          "cached_cse_file_version: %d\n",
-          cached_cse_file_version);
+          "cached_security_cse_versions: %d (AD) %d (sysvol)\n",
+          AD_INT_GPO_VERSION(cached_security_cse_versions),
+          SYSVOL_INT_GPO_VERSION(cached_security_cse_versions));
 
     security_cse_gpo->send_to_child = send_to_child;
 
@@ -2704,6 +2793,9 @@ ad_gpo_get_cse_security_file_done(struct tevent_req *subreq)
 {
     struct tevent_req *req;
     struct ad_gpo_cse_security_state *state;
+    int cse_version;
+    time_t cse_policy_file_timeout;
+    time_t now;
     int ret;
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
@@ -2724,6 +2816,39 @@ ad_gpo_get_cse_security_file_done(struct tevent_req *subreq)
         DEBUG(SSSDBG_OP_FAILURE, "Unable to retrieve policy data: [%d](%s}\n",
               ret, sss_strerror(ret));
         goto done;
+    }
+
+    cse_version =
+        ad_gpo_combine_gpo_versions(
+            SCOPEALIGN_INT_GPO_VERSION(security_cse_gpo->gpo_container_version,
+                                       state->policy_mode),
+            SCOPEALIGN_INT_GPO_VERSION(security_cse_gpo->gpo_file_system_version,
+                                       state->policy_mode));
+    now = time(NULL);
+    if (security_cse_gpo->send_to_child) {
+        DEBUG(SSSDBG_TRACE_FUNC,
+              "Updated security CSE version: %d (AD) %d (sysvol)\n",
+              AD_INT_GPO_VERSION(cse_version),
+              SYSVOL_INT_GPO_VERSION(cse_version));
+
+        /* [MS-GPOL] 3.2.1.17 Computer Policy Default Refresh Interval */
+        cse_policy_file_timeout = AD_GPO_DEFAULT_REFRESH_INTERVAL;
+
+        /* add default random offset */
+        cse_policy_file_timeout +=
+            (rand_r(&state->ro_seed) % AD_GPO_DEFAULT_REFRESH_MAX_OFFSET);
+
+        ret = sysdb_gpo_store_cse(state->host_domain,
+                                  gpo_guid,
+                                  state->cse_guid,
+                                  cse_version,
+                                  cse_policy_file_timeout, now);
+        if (ret != EOK) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "Unable to store gpo cache entry: [%d](%s}\n",
+                  ret, sss_strerror(ret));
+            goto done;
+        }
     }
 
     /*
@@ -2762,35 +2887,6 @@ int ad_gpo_cse_security_recv(struct tevent_req *req)
 
 
 /* == ad_gpo_core_send/recv helpers ======================================== */
-
-const char *ad_gpo_strmode(enum ad_gp_application_modes policy_mode)
-{
-    return gp_mode_to_str[policy_mode].msg;
-}
-
-/*
- * Get version number of the changes for the computer or the user policy
- * portion of a GPO depending on the policy application mode (scope)
- */
-int
-ad_gpo_scopealign_gpo_version(int gpo_version,
-                              enum ad_gp_application_modes policy_mode)
-{
-    int scopealigned_version = -1;
-
-    if (gpo_version == -1) {
-        return scopealigned_version;
-    }
-
-    if (policy_mode == AD_GP_MODE_USER) {
-        scopealigned_version = gpo_version & AD_GPO_USER_VERSION_MASK;
-        scopealigned_version >>= 16;
-    } else if (policy_mode == AD_GP_MODE_COMPUTER) {
-        scopealigned_version = gpo_version & AD_GPO_MACHINE_VERSION_MASK;
-    }
-
-    return scopealigned_version;
-}
 
 /* == ad_gpo_core_send/recv implementation ================================= */
 
