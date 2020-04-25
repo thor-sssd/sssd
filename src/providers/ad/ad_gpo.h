@@ -34,6 +34,11 @@
                       AD_AT_FLAGS, \
                       NULL}
 
+enum ad_gp_application_modes {
+    AD_GP_MODE_COMPUTER = 0,
+    AD_GP_MODE_USER
+};
+
 /*
  * This pair of functions provides client-side GPO processing.
  *
