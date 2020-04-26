@@ -26,6 +26,9 @@
  *
  * This file also implements the following pairs of *private* functions (which
  * are used by the public functions):
+ *   ad_gpo_process_core_send/recv: GPO core engine:
+ *                                  compute a list of gp_gpo objects
+ *   ad_gpo_process_target_send/recv: populate gp_target object
  *   ad_gpo_process_som_send/recv: populate list of gp_som objects
  *   ad_gpo_search_send/recv: populate list of gp_gpo objects
  *   ad_gpo_get_sd_referral_send/recv:  retrieve referred GPO data
@@ -67,6 +70,8 @@
 #define AD_AT_USER_EXT_NAMES "gPCUserExtensionNames"
 #define AD_AT_FUNC_VERSION "gPCFunctionalityVersion"
 #define AD_AT_FLAGS "flags"
+#define AD_AT_PRIMARY_GID "primaryGroupID"
+#define AD_AT_MEMBER_OF   "memberOf"
 
 #define UAC_WORKSTATION_TRUST_ACCOUNT 0x00001000
 #define UAC_SERVER_TRUST_ACCOUNT 0x00002000
@@ -113,6 +118,18 @@ int gpo_child_debug_fd = -1;
 
 /* == common data structures and declarations ============================= */
 
+struct gp_group {
+    const char *group_dn;
+    const char *group_sid;
+};
+
+struct gp_target {
+    const char *dn;
+    const char *sid;
+    const char **group_sids;
+    int num_groups;
+};
+
 struct gp_som {
     const char *som_dn;
     struct gp_gplink **gplink_list;
@@ -152,8 +169,8 @@ struct ad_gpo_core_state {
     struct dp_option *ad_options;
     int timeout;
     struct sss_domain_info *policy_target_domain;
-    const char *user;
-    const char *target_dn;
+    const char *policy_target_name;
+    struct gp_target *target;
     const char *cse_guid;
     struct gp_gpo **filtered_gpos;
     int num_filtered_gpos;
@@ -175,13 +192,29 @@ struct tevent_req *ad_gpo_core_send(TALLOC_CTX *mem_ctx,
                                     struct dp_option *ad_options,
                                     struct ad_id_ctx *ad_id_ctx,
                                     struct sdap_options *sdap_opts,
-                                    const char *user,
+                                    const char *policy_target_name,
                                     enum ad_gp_application_modes policy_mode,
                                     const char *cse_guid);
 int ad_gpo_core_recv(struct tevent_req *req,
                      TALLOC_CTX *mem_ctx,
                      struct gp_gpo ***_cse_filtered_gpos,
                      int *_num_cse_filtered_gpos);
+
+struct tevent_req *
+ad_gpo_process_target_send(TALLOC_CTX *mem_ctx,
+                           struct tevent_context *ev,
+                           struct sdap_id_op *sdap_op,
+                           struct sdap_options *opts,
+                           int timeout,
+                           const char *target_name,
+                           struct sss_domain_info *target_domain,
+                           enum ad_gp_application_modes policy_mode);
+int ad_gpo_process_target_recv(struct tevent_req *req,
+                               TALLOC_CTX *mem_ctx,
+                               const char **target_dn,
+                               const char **target_sid,
+                               struct gp_group ***target_groups,
+                               int *num_target_groups);
 
 struct tevent_req *ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
                                            struct tevent_context *ev,
@@ -656,6 +689,12 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
     }
 
     user_sid = ldb_msg_find_attr_as_string(res->msgs[0], SYSDB_SID_STR, NULL);
+    if (user_sid == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Missing SID for cache entry [%s].\n",
+              ldb_dn_get_linearized(res->msgs[0]->dn));
+        ret = EINVAL;
+        goto done;
+    }
     num_group_sids = (res->count) - 1;
 
     /* include space for AD_AUTHENTICATED_USERS_SID and NULL */
@@ -1037,7 +1076,7 @@ static errno_t ad_gpo_evaluate_dacl(struct security_acl *dacl,
 static errno_t
 ad_gpo_filter_gpos(TALLOC_CTX *mem_ctx,
                    struct sss_idmap_ctx *idmap_ctx,
-                   const char *target,
+                   struct gp_target *target,
                    struct sss_domain_info *domain,
                    enum ad_gp_application_modes policy_mode,
                    struct gp_gpo **candidate_gpos,
@@ -1051,9 +1090,6 @@ ad_gpo_filter_gpos(TALLOC_CTX *mem_ctx,
     struct gp_gpo *candidate_gpo = NULL;
     struct security_descriptor *sd = NULL;
     struct security_acl *dacl = NULL;
-    const char *user_sid = NULL;
-    const char **group_sids = NULL;
-    int group_size = 0;
     int gpo_dn_idx = 0;
     bool access_allowed = false;
     struct gp_gpo **filtered_gpos = NULL;
@@ -1062,20 +1098,6 @@ ad_gpo_filter_gpos(TALLOC_CTX *mem_ctx,
     if (tmp_ctx == NULL) {
         ret = ENOMEM;
         goto done;
-    }
-
-    ret = ad_gpo_get_sids(tmp_ctx, target, domain, &user_sid,
-                          &group_sids, &group_size);
-    if (ret != EOK) {
-        ret = ERR_NO_SIDS;
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Unable to retrieve SIDs: [%d](%s)\n", ret, sss_strerror(ret));
-        goto done;
-    }
-
-    DEBUG(SSSDBG_TRACE_ALL, "Policy target SID: %s\n", user_sid);
-    for (i = 0; i < group_size; i++) {
-        DEBUG(SSSDBG_TRACE_ALL, "Policy target group SID: %s\n", group_sids[i]);
     }
 
     filtered_gpos = talloc_array(tmp_ctx,
@@ -1130,8 +1152,9 @@ ad_gpo_filter_gpos(TALLOC_CTX *mem_ctx,
         }
 
         if ((sd->type & SEC_DESC_DACL_PRESENT) && (dacl != NULL)) {
-            ret = ad_gpo_evaluate_dacl(dacl, idmap_ctx, user_sid, group_sids,
-                                       group_size, &access_allowed);
+            ret = ad_gpo_evaluate_dacl(dacl, idmap_ctx, target->sid,
+                                       target->group_sids, target->num_groups,
+                                       &access_allowed);
             if (ret != EOK) {
                 DEBUG(SSSDBG_MINOR_FAILURE,
                       "Could not determine if GPO is applicable\n");
@@ -1819,12 +1842,17 @@ struct ad_gpo_access_state {
 };
 
 static void ad_gpo_connect_done(struct tevent_req *subreq);
-static void ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq);
+static void ad_gpo_process_target_done(struct tevent_req *subreq);
 static void ad_gpo_process_som_done(struct tevent_req *subreq);
 static void ad_gpo_search_done(struct tevent_req *subreq);
 static void ad_gpo_access_core_protocol_done(struct tevent_req *subreq);
 static errno_t ad_gpo_cse_security_step(struct tevent_req *req);
 static void ad_gpo_cse_security_done(struct tevent_req *subreq);
+static errno_t ad_gpo_populate_target_group_list(TALLOC_CTX *mem_ctx,
+                                                 struct gp_group **target_groups,
+                                                 int num_target_groups,
+                                                 const char ***_target_group_sids,
+                                                 int *_num_target_groups);
 
 struct tevent_req *
 ad_gpo_access_send(TALLOC_CTX *mem_ctx,
@@ -1842,6 +1870,7 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
     hash_key_t key;
     hash_value_t val;
     enum gpo_map_type gpo_map_type;
+    const char *sam_account_name;
 
     /* setup logging for gpo child */
     gpo_child_init();
@@ -1929,13 +1958,23 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
     state->opts = ctx->sdap_access_ctx->id_ctx->opts;
     state->timeout = dp_opt_get_int(state->opts->basic, SDAP_SEARCH_TIMEOUT);
 
+    /* SDAP_SASL_AUTHID contains the name used for kinit and SASL bind which
+     * in the AD case is the NetBIOS name. */
+    sam_account_name = dp_opt_get_string(state->opts->basic, SDAP_SASL_AUTHID);
+    if (sam_account_name == NULL) {
+        ret = ENOMEM;
+        goto immediately;
+    }
+    DEBUG(SSSDBG_TRACE_FUNC,
+          "policy target SAM account name is %s\n", sam_account_name);
+
     subreq = ad_gpo_core_send(state,
                               state->ev,
                               state->host_domain,
                               state->access_ctx->ad_options,
                               state->access_ctx->ad_id_ctx,
                               state->opts,
-                              state->user,
+                              sam_account_name,
                               state->policy_mode,
                               state->cse_guid);
     if (subreq == NULL) {
@@ -1991,15 +2030,10 @@ ad_gpo_connect_done(struct tevent_req *subreq)
 {
     struct tevent_req *req;
     struct ad_gpo_core_state *state;
-    char *filter;
-    const char *target_name = NULL;
-    char *domain_dn;
     int dp_error;
     errno_t ret;
     char *server_uri;
     LDAPURLDesc *lud;
-
-    const char *attrs[] = {AD_AT_DN, AD_AT_UAC, NULL};
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_core_state);
@@ -2048,56 +2082,20 @@ ad_gpo_connect_done(struct tevent_req *subreq)
     DEBUG(SSSDBG_TRACE_ALL, "server_hostname from uri: %s\n",
           state->server_hostname);
 
-    if (state->policy_mode == AD_GP_MODE_COMPUTER) {
-        /* SDAP_SASL_AUTHID contains the name used for kinit and SASL bind which
-         * in the AD case is the NetBIOS name. */
-        target_name = dp_opt_get_string(state->opts->basic, SDAP_SASL_AUTHID);
-        if (target_name == NULL) {
-            ret = ENOMEM;
-            goto done;
-        }
-        DEBUG(SSSDBG_TRACE_FUNC, "policy target SAM account name is %s\n",
-                                 target_name);
-    } else if (state->policy_mode == AD_GP_MODE_USER) {
-        target_name = state->user;
-        DEBUG(SSSDBG_TRACE_FUNC, "policy target name is %s\n", target_name);
-    }
-
-    /* Convert the domain name into domain DN */
-    ret = domain_to_basedn(state, state->policy_target_domain->name, &domain_dn);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Cannot convert domain name [%s] to base DN [%d]: %s\n",
-               state->policy_target_domain->name, ret, sss_strerror(ret));
-        goto done;
-    }
-
-    /* SDAP_OC_USER objectclass covers both users and computers */
-    filter = talloc_asprintf(state,
-                             "(&(objectclass=%s)(%s=%s))",
-                             state->opts->user_map[SDAP_OC_USER].name,
-                             state->opts->user_map[SDAP_AT_USER_NAME].name,
-                             target_name);
-    if (filter == NULL) {
+    subreq = ad_gpo_process_target_send(state,
+                                        state->ev,
+                                        state->sdap_op,
+                                        state->opts,
+                                        state->timeout,
+                                        state->policy_target_name,
+                                        state->policy_target_domain,
+                                        state->policy_mode);
+    if (subreq == NULL) {
         ret = ENOMEM;
         goto done;
     }
 
-    subreq = sdap_get_generic_send(state, state->ev, state->opts,
-                                   sdap_id_op_handle(state->sdap_op),
-                                   domain_dn, LDAP_SCOPE_SUBTREE,
-                                   filter, attrs, NULL, 0,
-                                   state->timeout,
-                                   false);
-
-    if (subreq == NULL) {
-        DEBUG(SSSDBG_OP_FAILURE, "sdap_get_generic_send failed.\n");
-        ret = EIO;
-        goto done;
-    }
-
-    tevent_req_set_callback(subreq, ad_gpo_target_dn_retrieval_done, req);
-
+    tevent_req_set_callback(subreq, ad_gpo_process_target_done, req);
     ret = EOK;
 
  done:
@@ -2108,81 +2106,57 @@ ad_gpo_connect_done(struct tevent_req *subreq)
 }
 
 static void
-ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq)
+ad_gpo_process_target_done(struct tevent_req *subreq)
 {
     struct tevent_req *req;
     struct ad_gpo_core_state *state;
+    const char *target_dn;
+    const char *target_sid;
+    struct gp_group **target_groups = NULL;
+    int num_target_groups = 0;
     int ret;
-    int dp_error;
-    size_t reply_count;
-    struct sysdb_attrs **reply;
-    const char *target_dn = NULL;
-    uint32_t uac;
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_core_state);
-    ret = sdap_get_generic_recv(subreq, state,
-                                &reply_count, &reply);
+    ret = ad_gpo_process_target_recv(subreq, state, &target_dn,
+                                     &target_sid, &target_groups,
+                                     &num_target_groups);
     talloc_zfree(subreq);
 
     if (ret != EOK) {
-        ret = sdap_id_op_done(state->sdap_op, ret, &dp_error);
-        if (ret == EAGAIN && dp_error == DP_ERR_OFFLINE) {
-            ret = ERR_OFFLINE;
-        } else {
-            ret = ENOENT;
-        }
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Unable to get policy target's DN: [%d](%s)\n",
-               ret, sss_strerror(ret));
         goto done;
     }
 
-    /* make sure there is only one non-NULL reply returned */
-
-    if (reply_count < 1) {
-        DEBUG(SSSDBG_OP_FAILURE, "No DN retrieved for policy target.\n");
-        ret = ENOENT;
-        goto done;
-    } else if (reply_count > 1) {
-        DEBUG(SSSDBG_OP_FAILURE, "Multiple replies for policy target\n");
-        ret = ERR_INTERNAL;
-        goto done;
-    } else if (reply == NULL) {
-        DEBUG(SSSDBG_OP_FAILURE, "reply_count is 1, but reply is NULL\n");
-        ret = ERR_INTERNAL;
-        goto done;
-    }
-
-    /* reply[0] holds requested attributes of single reply */
-    ret = sysdb_attrs_get_string(reply[0], AD_AT_DN, &target_dn);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "sysdb_attrs_get_string failed: [%d](%s)\n",
-               ret, sss_strerror(ret));
-        goto done;
-    }
-    state->target_dn = talloc_steal(state, target_dn);
-    if (state->target_dn == NULL) {
+    state->target = talloc_zero(state, struct gp_target);
+    if (state->target == NULL) {
         ret = ENOMEM;
         goto done;
     }
 
-    ret = sysdb_attrs_get_uint32_t(reply[0], AD_AT_UAC, &uac);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "sysdb_attrs_get_uint32_t failed: [%d](%s)\n",
-               ret, sss_strerror(ret));
+    state->target->dn = talloc_steal(state->target, target_dn);
+    if (state->target->dn == NULL) {
+        ret = ENOMEM;
         goto done;
     }
 
-    /* we only support computer policy targets, not users */
-    if (!(uac & UAC_WORKSTATION_TRUST_ACCOUNT ||
-          uac & UAC_SERVER_TRUST_ACCOUNT)) {
+    state->target->sid = talloc_steal(state->target, target_sid);
+    if (state->target->sid == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    state->target->group_sids = NULL;
+    state->target->num_groups = 0;
+
+    ret = ad_gpo_populate_target_group_list(state,
+                                            target_groups,
+                                            num_target_groups,
+                                            &state->target->group_sids,
+                                            &state->target->num_groups);
+    if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
-              "Invalid userAccountControl (%x) value for machine account.\n",
-              uac);
-        ret = EINVAL;
+              "Unable to populate target group list: [%d](%s)\n",
+              ret, sss_strerror(ret));
         goto done;
     }
 
@@ -2194,7 +2168,7 @@ ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq)
                                      state->opts,
                                      state->timeout,
                                      dp_opt_get_string(state->ad_options, AD_SITE),
-                                     state->target_dn,
+                                     state->target->dn,
                                      state->policy_target_domain->name);
     if (subreq == NULL) {
         ret = ENOMEM;
@@ -2308,10 +2282,18 @@ ad_gpo_search_done(struct tevent_req *subreq)
           dp_opt_get_string(state->ad_options, AD_HOSTNAME));
     DEBUG(SSSDBG_TRACE_ALL,
           "Policy target DN: %s\n",
-          state->target_dn);
+          state->target->dn);
+    DEBUG(SSSDBG_TRACE_ALL,
+          "Policy target SID: %s\n",
+          state->target->sid);
+    for (i = 0; i < state->target->num_groups; i++) {
+        DEBUG(SSSDBG_TRACE_ALL,
+              "Policy target group SID: %s\n",
+              state->target->group_sids[i]);
+    }
 
     ret = ad_gpo_filter_gpos(state, state->opts->idmap_ctx->map,
-                             state->user,
+                             state->target,
                              state->policy_target_domain,
                              state->policy_mode,
                              candidate_gpos, num_candidate_gpos,
@@ -2596,7 +2578,7 @@ ad_gpo_core_send(TALLOC_CTX *mem_ctx,
                  struct dp_option *ad_options,
                  struct ad_id_ctx *ad_id_ctx,
                  struct sdap_options *sdap_opts,
-                 const char *user,
+                 const char *policy_target_name,
                  enum ad_gp_application_modes policy_mode,
                  const char *cse_guid)
 {
@@ -2621,9 +2603,9 @@ ad_gpo_core_send(TALLOC_CTX *mem_ctx,
     state->num_cse_filtered_gpos = 0;
     state->cse_gpo_index = 0;
     state->ev = ev;
-    state->user = user;
+    state->policy_target_name = policy_target_name;
     state->ldb_ctx = sysdb_ctx_get_ldb(state->policy_target_domain->sysdb);
-    state->target_dn = NULL;
+    state->target = NULL;
     state->ad_id_ctx = ad_id_ctx;
     state->opts = sdap_opts;
     state->ad_options = ad_options;
@@ -2811,6 +2793,792 @@ ad_gpo_core_recv(struct tevent_req *req,
     *_num_cse_filtered_gpos = state->num_cse_filtered_gpos;
     return EOK;
 }
+
+/* == ad_gpo_process_target_send/recv helpers ============================== */
+
+/*
+ * This function extracts the SIDs of all passed groups of which the policy
+ * target is a member.
+ *
+ * Note: since authentication must complete successfully before the
+ * gpo access checks are called, we can safely assume that the user/computer
+ * has been authenticated. As such, this function always adds the
+ * AD_AUTHENTICATED_USERS_SID to the target_group_sids.
+ */
+static errno_t
+ad_gpo_populate_target_group_list(TALLOC_CTX *mem_ctx,
+                                  struct gp_group **target_groups,
+                                  int num_target_groups,
+                                  const char ***_target_group_sids,
+                                  int *_num_target_groups)
+{
+    TALLOC_CTX *tmp_ctx = NULL;
+    int i = 0;
+    int ret = 0;
+    struct gp_group *target_group = NULL;
+    const char **target_group_sids = NULL;
+    const char *target_group_sid = NULL;
+    int group_idx = 0;
+
+
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    target_group_sids = talloc_array(tmp_ctx,
+                                     const char *,
+                                     num_target_groups + 1);
+
+    if (target_group_sids == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    for (i = 0; i < num_target_groups; i++) {
+        target_group = target_groups[i];
+        target_group_sid = target_group->group_sid;
+
+        /* Not all group SIDs in the list may have been returned. If the group
+         * was not returned in the LDAP search response, the group SID is NULL
+         * and the group will be ignored. */
+        if (target_group_sid == NULL) {
+            continue;
+        }
+
+        target_group_sids[group_idx] =
+            talloc_steal(target_group_sids, target_group_sid);
+
+        if (target_group_sids[group_idx] == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+
+        group_idx++;
+    }
+
+    target_group_sids[group_idx] = NULL;
+
+    *_target_group_sids = talloc_steal(mem_ctx, target_group_sids);
+    *_num_target_groups = group_idx;
+
+    ret = EOK;
+
+ done:
+    talloc_free(tmp_ctx);
+    return ret;
+}
+
+/*
+ * This function extracts the groups of which the input user or computer is
+ * a member from the passed AD attributes "primaryGroupID" and "memberOf".
+ * The user or computer is identified by its SID (principal_sid).
+ * The function returns the number of groups and a list of member groups of
+ * the user or computer. The returned group structure contains either the
+ * SID of the member group or its DN.
+ */
+static errno_t
+ad_gpo_extract_groups(TALLOC_CTX *mem_ctx,
+                      const char *principal_sid,
+                      gid_t primary_gid,
+                      struct ldb_message_element *memberof,
+                      int *_num_groups,
+                      struct gp_group ***_groups)
+{
+
+    TALLOC_CTX *tmp_ctx = NULL;
+    char *dom_sid_str;
+    char *group_sid_str;
+    char *dn_str;
+    struct gp_group **target_groups;
+    int num_groups = 0;
+    int num_non_primary_groups = 0;
+    int num_primary_groups = 1;
+    const char **group_dns = NULL;
+    int ret;
+    int i = 0;
+    int group_idx = 0;
+
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    if (memberof) {
+        num_non_primary_groups = memberof->num_values;
+        if (num_non_primary_groups > 0) {
+            group_dns = talloc_array(tmp_ctx, const char *, num_non_primary_groups);
+            if (group_dns == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+            for (i = 0; i < num_non_primary_groups; i++) {
+                dn_str = (char *)memberof->values[i].data;
+                group_dns[group_idx] = talloc_steal(group_dns, dn_str);
+                if (group_dns[group_idx] == NULL) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+                group_idx++;
+            }
+        }
+    }
+
+    /* include space for AD_AUTHENTICATED_USERS_SID and NULL */
+    num_groups = num_non_primary_groups + num_primary_groups + 1;
+    target_groups = talloc_array(tmp_ctx,
+                                 struct gp_group *,
+                                 num_groups + 1);
+    if (target_groups == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    group_idx = 0;
+
+    /* The primary group ID is just the RID part of the objectSID
+     * of the group. Generate the GID by adding this to the domain
+     * SID value.
+     */
+
+    /* First, get the domain SID */
+    ret = sdap_idmap_get_dom_sid_from_object(tmp_ctx,
+                                             principal_sid,
+                                             &dom_sid_str);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_MINOR_FAILURE,
+              "Could not parse domain SID from [%s]\n", principal_sid);
+        goto done;
+    }
+
+    /* Add the RID to the end */
+    group_sid_str = talloc_asprintf(tmp_ctx, "%s-%lu", dom_sid_str,
+                                    (unsigned long) primary_gid);
+    if (!group_sid_str) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    target_groups[group_idx] = talloc_zero(target_groups, struct gp_group);
+    if (target_groups[group_idx] == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    target_groups[group_idx]->group_sid =
+        talloc_steal(target_groups[group_idx], group_sid_str);
+    if (target_groups[group_idx]->group_sid == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    group_idx++;
+
+    for (i = num_non_primary_groups - 1; i >= 0; i--) {
+        target_groups[group_idx] = talloc_zero(target_groups, struct gp_group);
+        if (target_groups[group_idx] == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        target_groups[group_idx]->group_dn =
+            talloc_steal(target_groups[group_idx], group_dns[i]);
+        if (target_groups[group_idx]->group_dn == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        group_idx++;
+    }
+
+    /* Since authentication must complete successfully before group policy
+     * application starts, we can safely assume that the user/computer
+     * has been authenticated. As such, this function always adds the
+     * AD_AUTHENTICATED_USERS_SID to the group_sids. */
+
+    target_groups[group_idx] = talloc_zero(target_groups, struct gp_group);
+    if (target_groups[group_idx] == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    target_groups[group_idx]->group_sid  =
+        talloc_strdup(target_groups, AD_AUTHENTICATED_USERS_SID);
+    if (target_groups[group_idx]->group_sid == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    group_idx++;
+
+    target_groups[group_idx] = NULL;
+
+    *_groups = talloc_steal(mem_ctx, target_groups);
+    *_num_groups = group_idx;
+
+    ret = EOK;
+
+ done:
+    talloc_free(tmp_ctx);
+    return ret;
+}
+
+/* == ad_gpo_process_target_send/recv implementation ======================= */
+
+struct ad_gpo_process_target_state {
+    struct tevent_context *ev;
+    struct sdap_id_op *sdap_op;
+    struct sdap_options *opts;
+    int timeout;
+    enum target_object {
+        AD_GP_TARGET_COMPUTER = 0,
+        AD_GP_TARGET_USER
+    } target_object;
+    struct sss_domain_info *target_domain;
+    const char *target_dn;
+    const char *target_name;
+    const char *target_sid;
+    struct gp_group **target_groups;
+    int num_target_groups;
+    int group_index;
+};
+
+
+static void ad_gpo_target_attrs_retrieval_done(struct tevent_req *req);
+static errno_t ad_gpo_get_target_sids_step(struct tevent_req *req);
+static void ad_gpo_get_target_sids_done(struct tevent_req *subreq);
+
+
+/*
+ * Add function description
+ */
+struct tevent_req *
+ad_gpo_process_target_send(TALLOC_CTX *mem_ctx,
+                           struct tevent_context *ev,
+                           struct sdap_id_op *sdap_op,
+                           struct sdap_options *opts,
+                           int timeout,
+                           const char *target_name,
+                           struct sss_domain_info *target_domain,
+                           enum ad_gp_application_modes policy_mode)
+{
+    struct tevent_req *req;
+    struct tevent_req *subreq;
+    struct ad_gpo_process_target_state *state;
+    char *domain_dn;
+    char *filter;
+    errno_t ret;
+
+    const char *attrs[] = {AD_AT_DN, AD_AT_UAC, AD_AT_OBJECT_SID,
+                           AD_AT_PRIMARY_GID, AD_AT_MEMBER_OF,
+                           NULL};
+
+    req = tevent_req_create(mem_ctx, &state, struct ad_gpo_process_target_state);
+    if (req == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "tevent_req_create() failed\n");
+        return NULL;
+    }
+
+    state->ev = ev;
+    state->sdap_op = sdap_op;
+    state->opts = opts;
+    state->timeout = timeout;
+    state->group_index = 0;
+    state->target_groups = NULL;
+    state->num_target_groups = 0;
+    state->target_domain = target_domain;
+    if (policy_mode == AD_GP_MODE_COMPUTER) {
+        state->target_object = AD_GP_TARGET_COMPUTER;
+    } else if (policy_mode == AD_GP_MODE_USER) {
+        state->target_object = AD_GP_TARGET_USER;
+    }
+    state->target_name = talloc_strdup(state, target_name);
+
+    /* SDAP_OC_USER objectclass covers both users and computers */
+    filter = talloc_asprintf(state,
+                             "(&(objectclass=%s)(|(%s=%s)(%s=%s)))",
+                             state->opts->user_map[SDAP_OC_USER].name,
+                             state->opts->user_map[SDAP_AT_USER_NAME].name,
+                             target_name,
+                             state->opts->user_map[SDAP_AT_USER_PRINC].name,
+                             target_name);
+    if (filter == NULL) {
+        ret = ENOMEM;
+        goto immediately;
+    }
+
+    /* Convert the domain name into domain DN */
+    ret = domain_to_basedn(state, state->target_domain->name, &domain_dn);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Cannot convert domain name [%s] to base DN [%d]: %s\n",
+               state->target_domain->name, ret, sss_strerror(ret));
+        goto immediately;
+    }
+
+    subreq = sdap_get_generic_send(state, state->ev, state->opts,
+                                   sdap_id_op_handle(state->sdap_op),
+                                   domain_dn, LDAP_SCOPE_SUBTREE,
+                                   filter, attrs, NULL, 0,
+                                   state->timeout,
+                                   false);
+    if (subreq == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "sdap_get_generic_send failed.\n");
+        ret = EIO;
+        goto immediately;
+    }
+
+    tevent_req_set_callback(subreq, ad_gpo_target_attrs_retrieval_done, req);
+
+    return req;
+
+ immediately:
+
+    if (ret == EOK) {
+        tevent_req_done(req);
+    } else {
+        tevent_req_error(req, ret);
+    }
+    return tevent_req_post(req, ev);
+}
+
+static void
+ad_gpo_target_attrs_retrieval_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req;
+    struct ad_gpo_process_target_state *state;
+    int ret;
+    int dp_error;
+    size_t reply_count;
+    struct sysdb_attrs **reply;
+    struct ldb_message_element *el;
+    const char *target_dn = NULL;
+    char *target_sid = NULL;
+    gid_t target_primary_gid;
+    struct gp_group *target_group =NULL;
+    const char **group_sids = NULL;
+    int group_size = 0;
+    struct ldb_message_element *target_memberof;
+    enum idmap_error_code err;
+    uint32_t uac;
+    int i;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_process_target_state);
+    ret = sdap_get_generic_recv(subreq, state,
+                                &reply_count, &reply);
+    talloc_zfree(subreq);
+
+    if (ret != EOK) {
+        ret = sdap_id_op_done(state->sdap_op, ret, &dp_error);
+        if (ret == EAGAIN && dp_error == DP_ERR_OFFLINE) {
+            ret = ERR_OFFLINE;
+        } else {
+            ret = ENOENT;
+        }
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Unable to get policy target attributes: [%d](%s)\n",
+               ret, sss_strerror(ret));
+        goto done;
+    }
+
+    /* make sure there is only one non-NULL reply returned */
+    if (reply_count < 1) {
+        DEBUG(SSSDBG_OP_FAILURE, "No attrs retrieved for policy target.\n");
+        ret = ENOENT;
+        goto done;
+    } else if (reply_count > 1) {
+        DEBUG(SSSDBG_OP_FAILURE, "Multiple replies for policy target\n");
+        ret = ERR_INTERNAL;
+        goto done;
+    } else if (reply == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "reply_count is 1, but reply is NULL\n");
+        ret = ERR_INTERNAL;
+        goto done;
+    }
+
+    /* reply[0] holds requested attributes of single reply */
+    ret = sysdb_attrs_get_string(reply[0], AD_AT_DN, &target_dn);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_attrs_get_string failed: [%d](%s)\n",
+               ret, sss_strerror(ret));
+        goto done;
+    }
+    state->target_dn = talloc_steal(state, target_dn);
+    if (state->target_dn == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    ret = sysdb_attrs_get_uint32_t(reply[0], AD_AT_UAC, &uac);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_attrs_get_uint32_t failed: [%d](%s)\n",
+               ret, sss_strerror(ret));
+        goto done;
+    }
+
+    if (state->target_object == AD_GP_TARGET_COMPUTER) {
+        if (!(uac & UAC_WORKSTATION_TRUST_ACCOUNT ||
+              uac & UAC_SERVER_TRUST_ACCOUNT)) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "Invalid userAccountControl (%x) value for machine account.\n",
+                  uac);
+            ret = EINVAL;
+            goto done;
+        }
+    } else if (state->target_object == AD_GP_TARGET_USER) {
+        if (!(uac & UAC_NORMAL_ACCOUNT)) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "Invalid userAccountControl (%x) value for user account.\n",
+                  uac);
+            ret = EINVAL;
+            goto done;
+        }
+    }
+
+    ret = sysdb_attrs_get_el(reply[0], AD_AT_OBJECT_SID, &el);
+    if (ret != EOK || el->num_values != 1) {
+        DEBUG(SSSDBG_OP_FAILURE, "sdap_attrs_get_el failed.\n");
+        goto done;
+    }
+
+    err = sss_idmap_bin_sid_to_sid(state->opts->idmap_ctx->map,
+                                   el->values[0].data,
+                                   el->values[0].length,
+                                   &target_sid);
+    if (err != IDMAP_SUCCESS) {
+        DEBUG(SSSDBG_MINOR_FAILURE,
+              "Could not convert SID: [%s].\n", idmap_error_string(err));
+        ret = EFAULT;
+        goto done;
+    }
+
+    /* for user policy targets we already have cached all SIDs during login */
+    if (state->target_object == AD_GP_TARGET_USER) {
+        ret = ad_gpo_get_sids(state, state->target_name,
+                              state->target_domain,
+                              &state->target_sid, &group_sids, &group_size);
+        if (ret == EOK) {
+            if (strcmp(state->target_sid, target_sid) == 0) {
+                state->target_groups = talloc_array(state,
+                                                    struct gp_group *,
+                                                    group_size + 1);
+                if (state->target_groups == NULL) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+                state->num_target_groups = group_size;
+                for (i=0; i<state->num_target_groups; i++) {
+                    state->target_groups[i] = talloc_zero(state->target_groups,
+                                                          struct gp_group);
+                    if (state->target_groups[i] == NULL) {
+                        ret = ENOMEM;
+                        break;
+                    }
+                    target_group = state->target_groups[i];
+                    target_group->group_sid =
+                        talloc_steal(target_group, group_sids[i]);
+                    if (target_group->group_sid == NULL) {
+                        ret = ENOMEM;
+                        break;
+                    }
+                }
+                goto done;
+            }
+            talloc_free(discard_const(state->target_sid));
+            state->target_sid = NULL;
+        }
+
+        ret = ERR_NO_SIDS;
+        DEBUG(SSSDBG_TRACE_FUNC,
+              "Unable to retrieve target SIDs from cache: [%d](%s)\n",
+              ret,
+              sss_strerror(ret));
+    }
+
+    state->target_sid = talloc_steal(state, target_sid);
+    if (state->target_sid == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    ret = sysdb_attrs_get_uint32_t(reply[0],
+                                   AD_AT_PRIMARY_GID,
+                                   &target_primary_gid);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_attrs_get_string failed: [%d](%s)\n",
+               ret, sss_strerror(ret));
+        goto done;
+    }
+
+    ret = sysdb_attrs_get_el(reply[0],
+                             AD_AT_MEMBER_OF,
+                             &target_memberof);
+    if (ret || !target_memberof || target_memberof->num_values == 0) {
+        target_memberof = NULL;
+    }
+
+    ret = ad_gpo_extract_groups(state,
+                                state->target_sid,
+                                target_primary_gid,
+                                target_memberof,
+                                &state->num_target_groups,
+                                &state->target_groups);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Unable to retrieve policy target group list: [%d](%s)\n",
+              ret, sss_strerror(ret));
+        goto done;
+    }
+
+    if (state->target_groups == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "No groups found for policy target\n");
+        ret = ENOENT;
+        goto done;
+    }
+
+    ret = ad_gpo_get_target_sids_step(req);
+
+ done:
+
+    if (ret == EOK) {
+        tevent_req_done(req);
+    } else if (ret != EAGAIN) {
+        tevent_req_error(req, ret);
+    }
+}
+
+static errno_t
+ad_gpo_get_target_sids_step(struct tevent_req *req)
+{
+    struct tevent_req *subreq;
+    int ret;
+    struct ad_gpo_process_target_state *state;
+    struct gp_group *target_group;
+    enum idmap_error_code err;
+    char *domain_dn;
+    char *filter;
+    uint8_t *bin_sid = NULL;
+    size_t length;
+    int i;
+
+    const char *attrs[] = {AD_AT_OBJECT_SID, AD_AT_DN, NULL};
+
+    state = tevent_req_data(req, struct ad_gpo_process_target_state);
+
+    target_group = state->target_groups[state->group_index];
+
+    /* target_group is NULL only after all target groups have been processed;
+     * group_sid is NULL if target group SID has to be fetched from AD
+     * group_dn is NULL if target group SID is available, but should be checked
+     * in AD for existance of the related group
+     */
+    while (target_group != NULL) {
+        if (target_group->group_sid == NULL) {
+            if (target_group->group_dn == NULL) {
+                state->group_index++;
+                target_group = state->target_groups[state->group_index];
+                continue;
+            }
+
+            filter = talloc_asprintf(state,
+                                     "(&(objectclass=%s)(distinguishedName=%s))",
+                                     state->opts->group_map[SDAP_OC_GROUP].name,
+                                     target_group->group_dn);
+            break;
+        } else if (strcmp(target_group->group_sid,
+                          AD_AUTHENTICATED_USERS_SID) == 0){
+            /* built-in group AUTHENTICATE_USERS is outside AD */
+            state->group_index++;
+            target_group = state->target_groups[state->group_index];
+            continue;
+        } else {
+            err = sss_idmap_sid_to_bin_sid(state->opts->idmap_ctx->map,
+                                           target_group->group_sid,
+                                           &bin_sid,
+                                           &length);
+            if (err != IDMAP_SUCCESS) {
+                DEBUG(SSSDBG_MINOR_FAILURE,
+                      "Could not convert SID: [%s].\n", idmap_error_string(err));
+                return EFAULT;
+            }
+
+            filter = talloc_asprintf(state,
+                                     "(&(objectclass=%s)(%s=",
+                                     state->opts->group_map[SDAP_OC_GROUP].name,
+                                     state->opts->group_map[SDAP_AT_GROUP_OBJECTSID].name);
+            for (i=0; i<length; i++) {
+                filter = talloc_asprintf_append(filter, "\\%02X", bin_sid[i]);
+            }
+            filter = talloc_asprintf_append(filter, "))");
+
+            break;
+        }
+    }
+
+    if (target_group == NULL) return EOK;
+
+    if (filter == NULL) {
+        return ENOMEM;
+    }
+
+    /* Convert the domain name into domain DN */
+    ret = domain_to_basedn(state, state->target_domain->name, &domain_dn);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Cannot convert domain name [%s] to base DN [%d]: %s\n",
+               state->target_domain->name, ret, sss_strerror(ret));
+        return ret;
+    }
+
+    subreq = sdap_get_generic_send(state, state->ev, state->opts,
+                                   sdap_id_op_handle(state->sdap_op),
+                                   domain_dn, LDAP_SCOPE_SUBTREE,
+                                   filter, attrs, NULL, 0,
+                                   state->timeout,
+                                   false);
+    if (subreq == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "sdap_get_generic_send failed.\n");
+        return ENOMEM;
+    }
+
+    tevent_req_set_callback(subreq, ad_gpo_get_target_sids_done, req);
+
+    return EAGAIN;
+}
+
+static void
+ad_gpo_get_target_sids_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req;
+    struct ad_gpo_process_target_state *state;
+    struct gp_group *target_group;
+    int ret;
+    int dp_error;
+    size_t num_results;
+    struct sysdb_attrs **results;
+    struct ldb_message_element *el;
+    char *group_sid = NULL;
+    const char *group_dn = NULL;
+    enum idmap_error_code err;
+
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_process_target_state);
+
+    ret = sdap_get_generic_recv(subreq, state,
+                                &num_results, &results);
+    talloc_zfree(subreq);
+
+    if (ret != EOK) {
+        ret = sdap_id_op_done(state->sdap_op, ret, &dp_error);
+
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Unable to get target group attributes: [%d](%s)\n",
+              ret, sss_strerror(ret));
+        ret = ENOENT;
+        goto done;
+    }
+
+    target_group = state->target_groups[state->group_index];
+
+    if ((num_results < 1) || (results == NULL)) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "No attrs found for target group; trying next target group.\n");
+        if (target_group->group_sid != NULL) {
+            /* Remoce group SID as it should not be used */
+            talloc_free(discard_const(target_group->group_sid));
+            target_group->group_sid = NULL;
+        }
+        state->group_index++;
+        ret = ad_gpo_get_target_sids_step(req);
+        goto done;
+    } else if (num_results > 1) {
+        DEBUG(SSSDBG_OP_FAILURE, "Received multiple replies\n");
+        ret = ERR_INTERNAL;
+        goto done;
+    }
+
+    /* results[0] holds requested attributes of single reply */
+    ret = sysdb_attrs_get_string(results[0], AD_AT_DN, &group_dn);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_attrs_get_string failed: [%d](%s)\n",
+               ret, sss_strerror(ret));
+        goto done;
+    }
+    /* Store DN of the target's primary group; for the target's memberOf
+     * groups it is already stored as it was used as basis to retrieve
+     * the group SID */
+    if (target_group->group_dn == NULL) {
+        target_group->group_dn = talloc_steal(target_group, group_dn);
+        if (target_group->group_dn == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+    }
+
+    ret = sysdb_attrs_get_el(results[0], AD_AT_OBJECT_SID, &el);
+    if (ret != EOK || el->num_values != 1) {
+        DEBUG(SSSDBG_OP_FAILURE, "sdap_attrs_get_el failed.\n");
+        goto done;
+    }
+
+    err = sss_idmap_bin_sid_to_sid(state->opts->idmap_ctx->map,
+                                   el->values[0].data,
+                                   el->values[0].length,
+                                   &group_sid);
+    if (err != IDMAP_SUCCESS) {
+        DEBUG(SSSDBG_MINOR_FAILURE,
+              "Could not convert SID: [%s].\n", idmap_error_string(err));
+        ret = EFAULT;
+        goto done;
+    }
+
+    /* Store SID of a target memberOf group; for the primary group it is
+     * already stored and has been approved by retrieving the related DN
+     * from AD */
+    if (target_group->group_sid == NULL) {
+        target_group->group_sid = talloc_strdup(target_group, group_sid);
+    }
+
+    DEBUG(SSSDBG_TRACE_ALL,
+          "target_groups[%d]->group_dn: [%s]\n",
+          state->group_index, target_group->group_dn);
+
+    state->group_index++;
+    ret = ad_gpo_get_target_sids_step(req);
+
+ done:
+
+    if (ret == EOK) {
+        tevent_req_done(req);
+    } else if (ret != EAGAIN) {
+        tevent_req_error(req, ret);
+    }
+}
+
+int
+ad_gpo_process_target_recv(struct tevent_req *req,
+                           TALLOC_CTX *mem_ctx,
+                           const char **target_dn,
+                           const char **target_sid,
+                           struct gp_group ***target_groups,
+                           int *num_target_groups)
+{
+    struct ad_gpo_process_target_state *state =
+        tevent_req_data(req, struct ad_gpo_process_target_state);
+
+    TEVENT_REQ_RETURN_ON_ERROR(req);
+
+    *target_dn = talloc_steal(mem_ctx, state->target_dn);
+    *target_sid = talloc_steal(mem_ctx, state->target_sid);
+    *target_groups = talloc_steal(mem_ctx, state->target_groups);
+    *num_target_groups = state->num_target_groups;
+
+    return EOK;
+}
+
 
 /* == ad_gpo_process_som_send/recv helpers ================================= */
 
