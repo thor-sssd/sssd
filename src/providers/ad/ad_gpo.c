@@ -223,6 +223,11 @@ struct gp_mode_string gp_mode_to_str[] = {
     { "user" },       /* AD_GP_MODE_USER */
 };
 
+static char *
+ad_gpo_compile_cse_purge_filter(TALLOC_CTX *mem_ctx,
+                                const char **applicable_cse_guid_list,
+                                int num_applicable_cse_guids);
+
 struct tevent_req *
 ad_gpo_cse_security_send(TALLOC_CTX *mem_ctx,
                          struct tevent_context *ev,
@@ -2976,6 +2981,7 @@ ad_gpo_cse_security_done(struct tevent_req *subreq)
     struct tevent_req *req;
     struct ad_gpo_access_state *state;
     const char **gPLink_list;
+    char *delete_filter;
     int num_gPLinks;
     int ret;
     errno_t lret;
@@ -3013,6 +3019,25 @@ ad_gpo_cse_security_done(struct tevent_req *subreq)
             DEBUG(SSSDBG_FUNC_DATA,
                   "Policy application data for %s stored in cache\n",
                   state->hostname);
+
+            /* delete_filter: Locate all security GPO CSEs in cache, which are
+             * not included in gPLink_list, i. e. obsolete security CSEs */
+            delete_filter = ad_gpo_compile_cse_purge_filter(tmp_ctx,
+                                                            gPLink_list,
+                                                            num_gPLinks);
+            if (delete_filter) {
+                ret = sysdb_gpo_cse_purge(state->host_domain,
+                                          state->cse_guid,
+                                          delete_filter);
+                if(ret == EOK) {
+                    DEBUG(SSSDBG_TRACE_FUNC,
+                          "Orphan GPO CSE %s cache cleanup successfully completed\n",
+                          state->cse_guid);
+                }
+            } else {
+                DEBUG(SSSDBG_MINOR_FAILURE,
+                      "Failed to compile GPO CSE delete_filter\n");
+            }
         }
         ret = ad_gpo_perform_hbac_processing(state,
                                              state->cse_guid,
@@ -3049,6 +3074,42 @@ ad_gpo_access_recv(struct tevent_req *req)
 
 
 /* == ad_gpo_cse_security_send/recv helpers ================================ */
+static char *
+ad_gpo_compile_cse_purge_filter(TALLOC_CTX *mem_ctx,
+                                const char **applicable_cse_guid_list,
+                                int num_applicable_cse_guids)
+{
+    char * delete_filter;
+    int filter_element_count;
+    int i;
+
+    delete_filter = talloc_asprintf(mem_ctx, "(&%s", SYSDB_CSE_FILTER);
+    if (delete_filter == NULL) {
+        return delete_filter;
+    }
+    filter_element_count = 1;
+    for (i=0; i < num_applicable_cse_guids; i++) {
+        if (i < num_applicable_cse_guids - 1) {
+            delete_filter = talloc_asprintf_append(delete_filter, "(&(!(dn=%s))",
+                                                   applicable_cse_guid_list[i]);
+            filter_element_count++;
+        } else {
+            delete_filter = talloc_asprintf_append(delete_filter, "(!(dn=%s))",
+                                                   applicable_cse_guid_list[i]);
+        }
+        if (delete_filter == NULL) {
+            return delete_filter;
+        }
+    }
+    for (i=0; i < filter_element_count; i++) {
+        delete_filter = talloc_strdup_append(delete_filter, ")");
+        if (delete_filter == NULL) {
+            return delete_filter;
+        }
+    }
+
+    return delete_filter;
+}
 
 /* == ad_gpo_cse_security_send/recv implementation ========================= */
 struct ad_gpo_cse_security_state {
