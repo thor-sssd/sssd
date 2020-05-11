@@ -404,6 +404,29 @@ int ad_gpo_container_gpo_version(int gpo_version)
     return ad_version;
 }
 
+bool
+ad_gpo_version_changed(int gpo_container_version,
+                       int gpo_filesystem_version,
+                       enum ad_gp_application_modes policy_mode,
+                       int cse_versions)
+{
+    bool retVal = false;
+    int gpo_version;
+
+    gpo_version = SCOPEALIGN_INT_GPO_VERSION(gpo_filesystem_version,
+                                             policy_mode);
+    gpo_version <<= 16;
+    gpo_version |= SCOPEALIGN_INT_GPO_VERSION(gpo_container_version,
+                                              policy_mode);
+    if ((SYSVOL_INT_GPO_VERSION(gpo_version) >
+         SYSVOL_INT_GPO_VERSION(cse_versions)) ||
+        (AD_INT_GPO_VERSION(gpo_version) >
+         AD_INT_GPO_VERSION(cse_versions))) {
+        retVal = true;
+    }
+    return retVal;
+}
+
 /* == ad_gpo_parse_map_options and helpers ==================================*/
 
 #define GPO_LOGIN "login"
@@ -1996,6 +2019,159 @@ ad_gpo_perform_hbac_processing(TALLOC_CTX *mem_ctx,
     return ret;
 }
 
+static errno_t
+ad_gpo_cache_refresh_status(struct sss_domain_info *domain,
+                            enum ad_gp_application_modes policy_mode,
+                            const char *cse_guid,
+                            const char **_gp_links,
+                            int _num_gp_links)
+{
+    TALLOC_CTX *tmp_ctx;
+    struct ldb_message **cse_results;
+    struct ldb_message **parent_gpo_results;
+    size_t num_cse_results;
+    size_t num_parent_gpo_results;
+    const char **cse_dn_list;
+    time_t *policy_file_timeout_list = NULL;
+    time_t now;
+    int *security_cse_version_list = NULL;
+    int *gpo_container_version_list = NULL;
+    int *gpo_filesystem_version_list = NULL;
+    int checked_gp_links = 0;
+    errno_t ret;
+    int i, k;
+
+    const char *cse_attrs[] = {SYSDB_CSE_TIMEOUT_ATTR,
+                               SYSDB_CSE_VERSION_ATTR,
+                               NULL};
+    const char *gpo_attrs[] = {SYSDB_GPO_AD_VERSION_ATTR,
+                               SYSDB_GPO_SYSVOL_VERSION_ATTR,
+                               NULL};
+
+
+    tmp_ctx = talloc_new(NULL);
+    if (!tmp_ctx) {
+        return ENOMEM;
+    }
+
+    ret = sysdb_gpo_cse_search(tmp_ctx, domain,
+                               cse_guid, cse_attrs,
+                               &num_cse_results,
+                               &cse_results);
+    if (ret != EOK) {
+        if (ret == ENOENT && _num_gp_links == 0) {
+            ret = EOK;
+        }
+        goto done;
+    }
+    ret = sysdb_gpo_cse_search_parent_gpo(tmp_ctx, domain,
+                                          cse_guid, gpo_attrs,
+                                          &num_parent_gpo_results,
+                                          &parent_gpo_results);
+    if (ret != EOK) {
+        goto done;
+    }
+    if (num_parent_gpo_results != num_cse_results) {
+        ret = EINVAL;
+        goto done;
+    }
+    cse_dn_list = talloc_array(tmp_ctx,
+                               const char *,
+                               num_cse_results + 1);
+    if (cse_dn_list == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    policy_file_timeout_list = talloc_array(tmp_ctx,
+                                            time_t,
+                                            num_cse_results + 1);
+    if (policy_file_timeout_list == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    security_cse_version_list = talloc_array(tmp_ctx,
+                                             int,
+                                             num_cse_results + 1);
+    if (security_cse_version_list == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    gpo_container_version_list = talloc_array(tmp_ctx,
+                                             int,
+                                             num_parent_gpo_results + 1);
+    if (gpo_container_version_list == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    gpo_filesystem_version_list = talloc_array(tmp_ctx,
+                                                int,
+                                                num_parent_gpo_results + 1);
+    if (gpo_filesystem_version_list == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    for (i = 0; i < num_cse_results; i++) {
+        /* ldb_search does not return CES DN as attribute;
+         * retrieve it from the result */
+        cse_dn_list[i] = ldb_dn_get_linearized(cse_results[i]->dn);
+        if (cse_dn_list[i] == NULL) {
+            DEBUG(SSSDBG_CRIT_FAILURE,
+                  "CSE DN is missing from result\n");
+            ret = EINVAL;
+            goto done;
+        }
+        policy_file_timeout_list[i] =
+                ldb_msg_find_attr_as_uint64(cse_results[i],
+                                            SYSDB_CSE_TIMEOUT_ATTR, 0);
+        security_cse_version_list[i] =
+            ldb_msg_find_attr_as_int(cse_results[i],
+                                     SYSDB_CSE_VERSION_ATTR, 0);
+    }
+    for (i = 0; i < num_parent_gpo_results; i++) {
+        gpo_container_version_list[i] =
+            ldb_msg_find_attr_as_int(parent_gpo_results[i],
+                                     SYSDB_GPO_AD_VERSION_ATTR, 0);
+        gpo_filesystem_version_list[i] =
+            ldb_msg_find_attr_as_int(parent_gpo_results[i],
+                                     SYSDB_GPO_SYSVOL_VERSION_ATTR, 0);
+    }
+    for (i = 0; i < _num_gp_links; i++) {
+        if (checked_gp_links < i) {
+            ret = ENOENT;
+            goto done;
+        }
+        now = time(NULL);
+        for (k = 0; k < num_cse_results; k++) {
+            if (cse_dn_list[k] == NULL) continue;
+            if (strcmp(_gp_links[i], cse_dn_list[k]) == 0) {
+                if (policy_file_timeout_list[k] < now) {
+                    ret = EINVAL;
+                    goto done;
+                }
+                /* Other (future) GPO applications might have updated GPOs
+                 * since last login. Check for changes in GPO version: */
+                if (ad_gpo_version_changed(gpo_container_version_list[k],
+                                           gpo_filesystem_version_list[k],
+                                           policy_mode,
+                                           security_cse_version_list[k])) {
+                    ret = EINVAL;
+                    goto done;
+                }
+                cse_dn_list[k] = NULL;
+                checked_gp_links++;
+                break;
+            }
+        }
+    }
+    if (checked_gp_links < _num_gp_links) {
+        ret = ENOENT;
+    }
+
+done:
+    talloc_free(tmp_ctx);
+    return ret;
+}
+
 /* == ad_gpo_access_send/recv implementation ================================*/
 
 struct ad_gpo_access_state {
@@ -2038,15 +2214,25 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
                    const char *user,
                    const char *service)
 {
+    TALLOC_CTX *tmp_ctx = NULL;
     struct tevent_req *req;
     struct tevent_req *subreq;
     struct ad_gpo_access_state *state;
     errno_t ret;
-    int hret;
+    int hret, lret;
     hash_key_t key;
     hash_value_t val;
+    time_t expiration_time;
     enum gpo_map_type gpo_map_type;
+    struct ldb_message *msg;
+    struct ldb_message_element *el;
+    const char *host_dn = NULL;
+    const char **gp_links = NULL;
+    int num_gp_links = 0;
+    int i;
 
+    const char *host_attrs[] = {SYSDB_ORIG_DN, SYSDB_GPLINK_STR,
+                                SYSDB_CACHE_EXPIRE, NULL};
     /* setup logging for gpo child */
     gpo_child_init();
 
@@ -2141,6 +2327,89 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
     DEBUG(SSSDBG_TRACE_FUNC,
           "Policy target SAM account name is %s\n", state->hostname);
 
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        ret = ENOMEM;
+        goto immediately;
+    }
+    lret = sysdb_get_computer(tmp_ctx,
+                              state->host_domain,
+                              state->hostname,
+                              host_attrs, &msg);
+    if (lret != EOK && lret != ENOENT) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_get_computer failed: [%d](%s)\n",
+              lret, sss_strerror(lret));
+        ret = lret;
+        goto immediately;
+    }
+    /* Configuration settings may have prevented SSSD from clening up
+     * the expired computer cache object */
+    if (lret == EOK) {
+        expiration_time = ldb_msg_find_attr_as_uint64(msg,
+                                                      SYSDB_CACHE_EXPIRE, 0);
+        if (expiration_time < time(NULL)) {
+            lret = ERR_ACCOUNT_EXPIRED;
+        }
+    }
+    if (lret == EOK) {
+        el = ldb_msg_find_element(msg, SYSDB_GPLINK_STR);
+        if (el != NULL && el->num_values > 0) {
+            num_gp_links = el->num_values;
+            gp_links = talloc_array(tmp_ctx,
+                                    const char *,
+                                    num_gp_links + 1);
+            if (gp_links == NULL) {
+                ret = ENOMEM;
+                goto immediately;
+            }
+            for (i = 0; i < num_gp_links; i++) {
+                gp_links[i] = talloc_steal(tmp_ctx,
+                                           (char *)el->values[i].data);
+                if (gp_links[i] == NULL) {
+                    ret = ENOMEM;
+                    goto immediately;
+                }
+            }
+            ret = ad_gpo_cache_refresh_status(state->host_domain,
+                                              state->policy_mode,
+                                              state->cse_guid,
+                                              gp_links,
+                                              num_gp_links);
+            if (ret == ENOMEM) {
+                goto immediately;
+            }
+            lret = ret;
+        }
+    }
+    if (lret == EOK) {
+        host_dn = ldb_msg_find_attr_as_string(msg, SYSDB_ORIG_DN, NULL);
+        DEBUG(SSSDBG_TRACE_ALL,
+              "Policy target DN: %s\n",
+              host_dn);
+        DEBUG(SSSDBG_FUNC_DATA,
+              "Using cached policy application data for access control\n");
+        for (i = 0; i < num_gp_links; i++) {
+            DEBUG(SSSDBG_TRACE_ALL, "security cse gPLink[%d] is %s\n",
+                                      i, gp_links[i]);
+        }
+
+        ret = ad_gpo_perform_hbac_processing(state,
+                                             state->cse_guid,
+                                             state->gpo_mode,
+                                             state->gpo_map_type,
+                                             state->user,
+                                             state->user_domain,
+                                             state->host_domain);
+        if (ret == EOK) {
+            goto immediately;
+        }
+    } else {
+        DEBUG(SSSDBG_FUNC_DATA,
+                "Policy application data for not in cache or expired [%s]\n",
+                state->hostname);
+    }
+
     subreq = ad_gpo_core_send(state,
                               state->ev,
                               state->host_domain,
@@ -2156,9 +2425,15 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
     }
     tevent_req_set_callback(subreq, ad_gpo_access_core_protocol_done, req);
 
+    if (tmp_ctx != NULL) {
+        talloc_free(tmp_ctx);
+    }
     return req;
 
 immediately:
+    if (tmp_ctx != NULL) {
+        talloc_free(tmp_ctx);
+    }
     if (ret == EOK) {
         tevent_req_done(req);
     } else {
@@ -2876,7 +3151,6 @@ ad_gpo_cse_security_step(struct tevent_req *req)
     struct ldb_result *res;
     errno_t ret;
     bool send_to_child = false;
-    int gpo_version = -1;
     int cached_security_cse_versions = -1;
     time_t policy_file_timeout = 0;
     int i;
@@ -2930,25 +3204,13 @@ ad_gpo_cse_security_step(struct tevent_req *req)
         policy_file_timeout =
             ldb_msg_find_attr_as_uint64(res->msgs[0],
                                         SYSDB_CSE_TIMEOUT_ATTR, 0);
-        if (policy_file_timeout < time(NULL)) {
+        if (policy_file_timeout < time(NULL) ||
+            ad_gpo_version_changed(security_cse_gpo->gpo_container_version,
+                                   security_cse_gpo->gpo_file_system_version,
+                                   state->policy_mode,
+                                   cached_security_cse_versions)) {
             send_to_child = true;
-        } else {
-            gpo_version =
-                SCOPEALIGN_INT_GPO_VERSION(security_cse_gpo->gpo_file_system_version,
-                                           state->policy_mode);
-            gpo_version <<= 16;
-            gpo_version |=
-                SCOPEALIGN_INT_GPO_VERSION(security_cse_gpo->gpo_container_version,
-                                           state->policy_mode);
-            /* [MS-GPOL] 3.2.1.1: Only download policy file, if GPO version has
-               changed */
-            if ((SYSVOL_INT_GPO_VERSION(gpo_version) >
-                 SYSVOL_INT_GPO_VERSION(cached_security_cse_versions)) ||
-                (AD_INT_GPO_VERSION(gpo_version) >
-                 AD_INT_GPO_VERSION(cached_security_cse_versions))) {
-                send_to_child = true;
-            }
-        }
+         }
     }
     else if (ret == ENOENT) {
         DEBUG(SSSDBG_TRACE_FUNC, "ENOENT\n");
