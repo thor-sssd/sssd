@@ -231,7 +231,10 @@ ad_gpo_cse_security_send(TALLOC_CTX *mem_ctx,
                          const char *cse_guid,
                          struct gp_gpo **filtered_gpos,
                          int num_filtered_gpos);
-int ad_gpo_cse_security_recv(struct tevent_req *req);
+int ad_gpo_cse_security_recv(struct tevent_req *req,
+                             TALLOC_CTX *mem_ctx,
+                             const char ***_cached_cse_dn_list,
+                             int *_num_cached_cse_dns);
 
 struct tevent_req *ad_gpo_core_send(TALLOC_CTX *mem_ctx,
                                     struct tevent_context *ev,
@@ -2043,7 +2046,6 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
     hash_key_t key;
     hash_value_t val;
     enum gpo_map_type gpo_map_type;
-    const char *sam_account_name;
 
     /* setup logging for gpo child */
     gpo_child_init();
@@ -2157,7 +2159,6 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
     return req;
 
 immediately:
-
     if (ret == EOK) {
         tevent_req_done(req);
     } else {
@@ -2696,19 +2697,48 @@ ad_gpo_filtering_done(struct tevent_req *subreq)
 static void
 ad_gpo_cse_security_done(struct tevent_req *subreq)
 {
+    TALLOC_CTX *tmp_ctx = NULL;
     struct tevent_req *req;
     struct ad_gpo_access_state *state;
+    const char **gPLink_list;
+    int num_gPLinks;
     int ret;
+    errno_t lret;
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_access_state);
 
-    ret = ad_gpo_cse_security_recv(subreq);
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
 
+    ret = ad_gpo_cse_security_recv(subreq,
+                                   tmp_ctx,
+                                   &gPLink_list,
+                                   &num_gPLinks);
     talloc_zfree(subreq);
 
     if (ret == EOK) {
         /* ret is EOK only after all GPO policy files have been downloaded */
+        lret = sysdb_computer_setgplinks(state->host_domain,
+                                         state->hostname,
+                                         gPLink_list,
+                                         num_gPLinks);
+        if (lret != EOK) {
+            DEBUG(SSSDBG_TRACE_FUNC,
+                  "Could not store security CSE gplinks for %s: [%d](%s}\n",
+                  state->hostname, lret, sss_strerror(lret));
+            if (lret == ENOMEM) {
+                ret = lret;
+                goto done;
+            }
+        } else {
+            DEBUG(SSSDBG_FUNC_DATA,
+                  "Policy application data for %s stored in cache\n",
+                  state->hostname);
+        }
         ret = ad_gpo_perform_hbac_processing(state,
                                              state->cse_guid,
                                              state->gpo_mode,
@@ -2722,6 +2752,11 @@ ad_gpo_cse_security_done(struct tevent_req *subreq)
         }
     }
 
+ done:
+
+    if (tmp_ctx != NULL) {
+        talloc_free(tmp_ctx);
+    }
     if (ret == EOK) {
         tevent_req_done(req);
     } else {
@@ -2750,6 +2785,8 @@ struct ad_gpo_cse_security_state {
     struct gp_gpo **security_cse_gpos;
     int num_security_cse_gpos;
     int gpo_index;
+    const char **cached_cse_dn_list;
+    int num_cached_cse_dn;
 };
 
 static errno_t ad_gpo_cse_security_step(struct tevent_req *req);
@@ -2791,6 +2828,8 @@ ad_gpo_cse_security_send(TALLOC_CTX *mem_ctx,
     state->security_cse_gpos = talloc_steal(state, security_cse_gpos);
     state->num_security_cse_gpos = num_security_cse_gpos;
     state->gpo_index = 0;
+    state->cached_cse_dn_list = NULL;
+    state->num_cached_cse_dn = 0;
 
     /*
     * before we start processing each gpo, we delete the GP Result object
@@ -2955,11 +2994,15 @@ ad_gpo_cse_security_step(struct tevent_req *req)
 static void
 ad_gpo_get_cse_security_file_done(struct tevent_req *subreq)
 {
+    TALLOC_CTX *tmp_ctx;
     struct tevent_req *req;
     struct ad_gpo_cse_security_state *state;
+    const char *attrs[] = {NULL};
+    const char * cse_dn = NULL;
     int cse_version;
     time_t cse_policy_file_timeout;
     time_t now;
+    struct ldb_result *res;
     int ret;
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
@@ -3030,11 +3073,60 @@ ad_gpo_get_cse_security_file_done(struct tevent_req *subreq)
         goto done;
     }
 
+    tmp_ctx = talloc_new(NULL);
+    if (!tmp_ctx) {
+        ret = ENOMEM;
+        goto done;
+    }
+    ret = sysdb_gpo_get_cse_by_guid(tmp_ctx,
+                                    state->host_domain,
+                                    gpo_guid,
+                                    state->cse_guid,
+                                    attrs,
+                                    &res);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "No access to security CSE of GPO %s in cache: [%d](%s)\n",
+              gpo_guid, ret, sss_strerror(ret));
+        goto done;
+    }
+    /* ldb_search does not return CES DN as attribute;
+     * retrieve it from the result */
+    cse_dn = ldb_dn_get_linearized(res->msgs[0]->dn);
+    if (cse_dn == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Access to DN of security CSE of GPO %s failed\n",
+              gpo_guid);
+        ret = EINVAL;
+        goto done;
+    }
+    if (state->cached_cse_dn_list == NULL) {
+        state->cached_cse_dn_list = talloc_array(state,
+                                                 const char *,
+                                                 state->num_security_cse_gpos + 1);
+        if (state->cached_cse_dn_list == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        state->num_cached_cse_dn = 0;
+    }
+    state->cached_cse_dn_list[state->num_cached_cse_dn] =
+            talloc_steal(state->cached_cse_dn_list, cse_dn);
+    if (state->cached_cse_dn_list[state->num_cached_cse_dn] == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    DEBUG(SSSDBG_TRACE_ALL, "gplink[%d] for host is: (%s)\n",
+          state->num_cached_cse_dn, cse_dn);
+    state->num_cached_cse_dn++;
+
     state->gpo_index++;
     ret = ad_gpo_cse_security_step(req);
 
  done:
-
+    if (tmp_ctx != NULL) {
+        talloc_free(tmp_ctx);
+    }
     if (ret == EOK) {
         tevent_req_done(req);
     } else if (ret != EAGAIN) {
@@ -3042,10 +3134,18 @@ ad_gpo_get_cse_security_file_done(struct tevent_req *subreq)
     }
 }
 
-int ad_gpo_cse_security_recv(struct tevent_req *req)
+int ad_gpo_cse_security_recv(struct tevent_req *req,
+                             TALLOC_CTX *mem_ctx,
+                             const char ***_cached_cse_dn_list,
+                             int *_num_cached_cse_dns)
 {
+    struct ad_gpo_cse_security_state *state =
+        tevent_req_data(req, struct ad_gpo_cse_security_state);
+
     TEVENT_REQ_RETURN_ON_ERROR(req);
 
+    *_cached_cse_dn_list = talloc_steal(mem_ctx, state->cached_cse_dn_list);
+    *_num_cached_cse_dns = state->num_cached_cse_dn;
     return EOK;
 }
 
