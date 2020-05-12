@@ -71,6 +71,7 @@
 #define AD_AT_GPOPTIONS "gpOptions"
 #define AD_AT_NT_SEC_DESC "nTSecurityDescriptor"
 #define AD_AT_CN "cn"
+#define AD_AT_DISPLAY_NAME "displayName"
 #define AD_AT_FILE_SYS_PATH "gPCFileSysPath"
 #define AD_AT_MACHINE_EXT_NAMES "gPCMachineExtensionNames"
 #define AD_AT_USER_EXT_NAMES "gPCUserExtensionNames"
@@ -174,6 +175,7 @@ struct gp_gpo {
     struct security_descriptor *gpo_sd;
     const char *gpo_dn;
     const char *gpo_guid;
+    const char *gpo_display_name;
     const char *smb_server;
     const char *smb_share;
     const char *smb_path;
@@ -1292,8 +1294,8 @@ ad_gpo_filter_gpos(TALLOC_CTX *mem_ctx,
             continue;
         }
 
-        DEBUG(SSSDBG_TRACE_FUNC, "examining candidate_gpo_guid:%s\n",
-              candidate_gpo->gpo_guid);
+        DEBUG(SSSDBG_TRACE_FUNC, "examining candidate_gpo_guid: %s (%s)\n",
+              candidate_gpo->gpo_guid, candidate_gpo->gpo_display_name);
 
         /* gpo_func_version must be set to version 2 */
         if (candidate_gpo->gpo_func_version != 2) {
@@ -2920,8 +2922,8 @@ ad_gpo_filtering_done(struct tevent_req *subreq)
     }
 
     for (i = 0; i < num_filtered_gpos; i++) {
-        DEBUG(SSSDBG_TRACE_FUNC, "filtered_gpos[%d]->gpo_guid is %s\n", i,
-              filtered_gpos[i]->gpo_guid);
+        DEBUG(SSSDBG_TRACE_FUNC, "filtered_gpos[%d]: %s (%s)\n", i,
+              filtered_gpos[i]->gpo_guid, filtered_gpos[i]->gpo_display_name);
     }
 
     if (state->cse_guid == NULL) {
@@ -6049,6 +6051,7 @@ ad_gpo_sd_process_attrs(struct tevent_req *req,
     int ret;
     struct ldb_message_element *el = NULL;
     const char *gpo_guid = NULL;
+    const char *gpo_display_name = NULL;
     const char *gpo_dn = NULL;
     const char *raw_file_sys_path = NULL;
     char *file_sys_path = NULL;
@@ -6074,6 +6077,16 @@ ad_gpo_sd_process_attrs(struct tevent_req *req,
         state->gpo_index++;
         ret = ad_gpo_get_gpo_attrs_step(req);
         goto done;
+    }
+
+    /* retrieve AD_AT_DISPLAY_NAME (optional, for GPO analysis */
+    ret = sysdb_attrs_get_string(result, AD_AT_DISPLAY_NAME, &gpo_display_name);
+    if (ret == EOK) {
+        gp_gpo->gpo_display_name = talloc_steal(gp_gpo, gpo_display_name);
+        if (gp_gpo->gpo_display_name == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
     }
 
     /* retrieve AD_AT_CN */
@@ -6710,6 +6723,7 @@ ad_gpo_get_gpt_file_done(struct tevent_req *subreq)
         ret = sysdb_gpo_store_gpo(state->policy_target_domain,
                                   gpo_guid,
                                   filtered_gpo->gpo_dn,
+                                  filtered_gpo->gpo_display_name,
                                   filtered_gpo->gpo_container_version,
                                   sysvol_gpt_version,
                                   state->gpo_timeout_option, now);

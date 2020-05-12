@@ -7171,11 +7171,13 @@ START_TEST(test_gpo_store_retrieve)
     struct ldb_result *result = NULL;
     const char *guid;
     const char *gpo_dn;
+    const char *display_name;
     int version;
     int timeout;
     static const char *test_guid = "{3610EDA5-77EF-11D2-8DC5-00C04FA31A66}";
     static const char *test_dn =
         "cn={3610EDA5-77EF-11D2-8DC5-00C04FA31A66},cn=policies,cn=system,DC=example,DC=com";
+    static const char *test_name = "AD GPO SysDB Test";
     const char *attrs[] = SYSDB_GPO_ATTRS;
 
     ret = setup_sysdb_tests(&test_ctx);
@@ -7191,7 +7193,7 @@ START_TEST(test_gpo_store_retrieve)
     fail_if(ret != ENOENT, "GPO present in cache before store op");
 
     ret = sysdb_gpo_store_gpo(test_ctx->domain,
-                              test_guid, test_dn, 1, 1, 0, 0);
+                              test_guid, test_dn, test_name, 1, 1, 0, 0);
     fail_if(ret != EOK, "Could not store a test GPO");
 
     ret = sysdb_gpo_get_gpos(test_ctx, test_ctx->domain, attrs, &result);
@@ -7209,6 +7211,10 @@ START_TEST(test_gpo_store_retrieve)
     guid = ldb_msg_find_attr_as_string(result->msgs[0],
                                        SYSDB_GPO_GUID_ATTR, NULL);
     ck_assert_str_eq(guid, test_guid);
+
+    display_name = ldb_msg_find_attr_as_string(result->msgs[0],
+                                               SYSDB_NAME, NULL);
+    ck_assert_str_eq(display_name, test_name);
 
     gpo_dn = ldb_msg_find_attr_as_string(result->msgs[0],
                                          SYSDB_ORIG_DN, NULL);
@@ -7237,10 +7243,12 @@ START_TEST(test_gpo_replace)
     struct ldb_result *result = NULL;
     const char *guid;
     const char *gpo_dn;
+    const char *display_name;
     int version;
     static const char *test_guid = "{3610EDA5-77EF-11D2-8DC5-00C04FA31A66}";
     static const char *test_dn =
         "cn={3610EDA5-77EF-11D2-8DC5-00C04FA31A66},cn=policies,cn=system,DC=sub,DC=example,DC=com";
+    static const char *test_name = "AD GPO SysDB Test New";
     const char *attrs[] = SYSDB_GPO_ATTRS;
 
     ret = setup_sysdb_tests(&test_ctx);
@@ -7266,7 +7274,7 @@ START_TEST(test_gpo_replace)
 
     /* Modify the version */
     ret = sysdb_gpo_store_gpo(test_ctx->domain,
-                              test_guid, test_dn, 2, 3, 5, 0);
+                              test_guid, test_dn, test_name, 2, 3, 5, 0);
     fail_if(ret != EOK, "Could not store a test GPO");
 
     ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
@@ -7282,6 +7290,10 @@ START_TEST(test_gpo_replace)
     gpo_dn = ldb_msg_find_attr_as_string(result->msgs[0],
                                          SYSDB_ORIG_DN, NULL);
     ck_assert_str_eq(gpo_dn, test_dn);
+
+    display_name = ldb_msg_find_attr_as_string(result->msgs[0],
+                                               SYSDB_NAME, NULL);
+    ck_assert_str_eq(display_name, test_name);
 
     version = ldb_msg_find_attr_as_uint(result->msgs[0],
                                         SYSDB_GPO_AD_VERSION_ATTR, 0);
@@ -7312,6 +7324,9 @@ START_TEST(test_gpo_cse_store_retrieve)
     static const char *test_guid[] = {"{2F1FD423-D089-4DF5-AFAA-8C2B0E340464}",
                                       "{AB19E078-6405-40AA-BA43-635E95D090AF}",
                                       "{32EF709E-1337-4947-8794-5E53E958F1AE}"};
+    static const char *test_gpo_name[] = {"SYSDB Test GPO #1",
+                                          "SYSDB Test GPO #2",
+                                          "SYSDB Test GPO #3"};
     static const char *test_dn[] = {
         "cn={2F1FD423-D089-4DF5-AFAA-8C2B0E340464},cn=policies,cn=system,DC=example,DC=com",
         "cn={AB19E078-6405-40AA-BA43-635E95D090AF},cn=policies,cn=system,DC=example,DC=com",
@@ -7349,7 +7364,8 @@ START_TEST(test_gpo_cse_store_retrieve)
     for(i=0; i<3; i++) {
         /* Version attribute contains GUID array index */
         ret = sysdb_gpo_store_gpo(test_ctx->domain,
-                                  test_guid[i], test_dn[i], i, i, i, 1);
+                                  test_guid[i], test_dn[i], test_gpo_name[i],
+                                  i, i, i, 1);
         fail_if(ret != EOK, "Could not store a test GPO");
 
         ret = sysdb_gpo_store_cse(test_ctx->domain,
@@ -7700,6 +7716,9 @@ START_TEST(test_gpo_cse_purge_filter)
         "cn={2F1FD423-D089-4DF5-AFAA-8C2B0E340464},cn=policies,cn=system,DC=example,DC=com",
         "cn={AB19E078-6405-40AA-BA43-635E95D090AF},cn=policies,cn=system,DC=example,DC=com",
         "cn={32EF709E-1337-4947-8794-5E53E958F1AE},cn=policies,cn=system,DC=example,DC=com"};
+    static const char *test_gpo_name[] = {"SYSDB Test GPO CSE Purge #1",
+                                          "SYSDB Test GPO CSE Purge #2",
+                                          "SYSDB Test GPO CSE Purge #3"};
     const char *gpo_attrs[] = SYSDB_GPO_ATTRS;
     const char *gpo_cse_attrs[] = SYSDB_CSE_ATTRS;
 
@@ -7748,7 +7767,8 @@ START_TEST(test_gpo_cse_purge_filter)
     now = time(NULL);
     for(i=0; i<3; i++) {
         ret = sysdb_gpo_store_gpo(test_ctx->domain,
-                                  test_guid[i], test_dn[i], i, i, 5, now);
+                                  test_guid[i], test_dn[i], test_gpo_name[i],
+                                  i, i, 5, now);
         fail_if(ret != EOK, "Could not store a test GPO (%d)", i);
 
         ret = sysdb_gpo_store_cse(test_ctx->domain,
@@ -8075,6 +8095,7 @@ START_TEST(test_gpo_cse_purge_parent_gpo)
     const char *cse_dn;
     char *delete_filter;
     const char *guid;
+    const char *display_name;
     time_t now;
     time_t timeout;
     int i;
@@ -8091,6 +8112,10 @@ START_TEST(test_gpo_cse_purge_parent_gpo)
         "cn={AB19E078-6405-40AA-BA43-635E95D090AF},cn=policies,cn=system,DC=example,DC=com",
         "cn={32EF709E-1337-4947-8794-5E53E958F1AE},cn=policies,cn=system,DC=example,DC=com",
         "cn={3610EDA5-77EF-11D2-8DC5-00C04FA31A66},cn=policies,cn=system,DC=example,DC=com"};
+    static const char *test_gpo_name[] = {"SYSDB Test GPO CSE Purge Parent #1",
+                                          "SYSDB Test GPO CSE Purge Parent #2",
+                                          "SYSDB Test GPO CSE Purge Parent #3",
+                                          "SYSDB Test GPO CSE Purge Parent #4"};
     const char *gpo_attrs[] = SYSDB_GPO_ATTRS;
     const char *gpo_cse_attrs[] = SYSDB_CSE_ATTRS;
 
@@ -8113,11 +8138,13 @@ START_TEST(test_gpo_cse_purge_parent_gpo)
     for(i=0; i<4; i++) {
         if (i != 2) {
             ret = sysdb_gpo_store_gpo(test_ctx->domain,
-                                      test_guid[i], test_dn[i], i, i, 5, now - 6);
+                                      test_guid[i], test_dn[i], test_gpo_name[i],
+                                      i, i, 5, now - 6);
             fail_if(ret != EOK, "Could not store a test GPO (%d)", i);
         } else {
             ret = sysdb_gpo_store_gpo(test_ctx->domain,
-                                      test_guid[i], test_dn[i], i, i, 5, now);
+                                      test_guid[i], test_dn[i], test_gpo_name[i],
+                                      i, i, 5, now);
             fail_if(ret != EOK, "Could not store a test GPO (%d)", i);
         }
         ret = sysdb_gpo_store_cse(test_ctx->domain,
@@ -8162,6 +8189,10 @@ START_TEST(test_gpo_cse_purge_parent_gpo)
         guid = ldb_msg_find_attr_as_string(result->msgs[0],
                                            SYSDB_GPO_GUID_ATTR, NULL);
         ck_assert_str_eq(guid, test_guid[i]);
+
+        display_name = ldb_msg_find_attr_as_string(result->msgs[0],
+                                                   SYSDB_NAME, NULL);
+        ck_assert_str_eq(display_name, test_gpo_name[i]);
 
         timeout = ldb_msg_find_attr_as_uint64(result->msgs[0],
                                               SYSDB_GPO_TIMEOUT_ATTR, 0);

@@ -50,6 +50,7 @@ errno_t
 sysdb_gpo_store_gpo(struct sss_domain_info *domain,
                     const char *gpo_guid,
                     const char *gpo_dn,
+                    const char *gpo_name,
                     int gpo_ad_version,
                     int gpo_sysvol_version,
                     int cache_timeout,
@@ -147,6 +148,21 @@ sysdb_gpo_store_gpo(struct sss_domain_info *domain,
             goto done;
         }
 
+        /* Add GPO name */
+        lret = ldb_msg_add_empty(update_msg, SYSDB_NAME,
+                                 LDB_FLAG_MOD_ADD,
+                                 NULL);
+        if (lret != LDB_SUCCESS) {
+            ret = sss_ldb_error_to_errno(lret);
+            goto done;
+        }
+
+        lret = ldb_msg_add_string(update_msg, SYSDB_NAME, gpo_name);
+        if (lret != LDB_SUCCESS) {
+            ret = sss_ldb_error_to_errno(lret);
+            goto done;
+        }
+
         /* Add GPO container version */
         lret = ldb_msg_add_empty(update_msg, SYSDB_GPO_AD_VERSION_ATTR,
                                  LDB_FLAG_MOD_ADD,
@@ -205,6 +221,21 @@ sysdb_gpo_store_gpo(struct sss_domain_info *domain,
     } else if (ret == EOK && count == 1) {
         DEBUG(SSSDBG_TRACE_ALL, "Updating GPO [%s][%s]\n",
               domain->name, gpo_guid);
+
+        /* Update GPO display name */
+        lret = ldb_msg_add_empty(update_msg, SYSDB_NAME,
+                                 LDB_FLAG_MOD_REPLACE,
+                                 NULL);
+        if (lret != LDB_SUCCESS) {
+            ret = sss_ldb_error_to_errno(lret);
+            goto done;
+        }
+
+        lret = ldb_msg_add_string(update_msg, SYSDB_NAME, gpo_name);
+        if (lret != LDB_SUCCESS) {
+            ret = sss_ldb_error_to_errno(lret);
+            goto done;
+        }
 
         /* Update original GPO DN */
         lret = ldb_msg_add_empty(update_msg, SYSDB_ORIG_DN,

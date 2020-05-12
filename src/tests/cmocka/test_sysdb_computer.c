@@ -98,6 +98,9 @@ static struct test_data *test_data_new_computer(struct computer_test_ctx *test_c
         "cn={2F1FD423-D089-4DF5-AFAA-8C2B0E340464},cn=policies,cn=system,DC=testdomain,DC=test",
         "cn={AB19E078-6405-40AA-BA43-635E95D090AF},cn=policies,cn=system,DC=testdomain,DC=test",
         "cn={32EF709E-1337-4947-8794-5E53E958F1AE},cn=policies,cn=system,DC=testdomain,DC=test"};
+    static const char *test_gpo_name[] = {"SYSDB Computer Test GPO #1",
+                                          "SYSDB Computer Test GPO #2",
+                                          "SYSDB Computer Test GPO #3"};
     static const char *test_cse_dn[] = {
         "cseGUID={827D319E-6EAC-11D2-A4EA-00C04F79F83A},"
             "gpoGUID={2F1FD423-D089-4DF5-AFAA-8C2B0E340464},"
@@ -148,6 +151,7 @@ static struct test_data *test_data_new_computer(struct computer_test_ctx *test_c
             data->linked_gpos[i]->gpo_cse_guids[k] = test_cse_guid[k];
         }
         data->linked_gpos[i]->gpo_dn = test_gpo_dn[i];
+        data->linked_gpos[i]->gpo_display_name = test_gpo_name[i];
         data->linked_gpos[i]->gpo_guid = test_guid[i];
         data->linked_gpos[i]->gpo_container_version = 0x1000400;
         data->linked_gpos[i]->gpo_file_system_version = 0xFF03FF;
@@ -656,6 +660,7 @@ void test_check_gpo_cache_status_no_refresh(void **state)
         ret = sysdb_gpo_store_gpo(test_ctx->tctx->dom,
                                   data->linked_gpos[i]->gpo_guid,
                                   data->linked_gpos[i]->gpo_dn,
+                                  data->linked_gpos[i]->gpo_display_name,
                                   data->linked_gpos[i]->gpo_container_version,
                                   data->linked_gpos[i]->gpo_file_system_version,
                                   5, now);
@@ -816,6 +821,7 @@ void test_check_gpo_cache_status_fs_version_change(void **state)
     ret = sysdb_gpo_store_gpo(test_ctx->tctx->dom,
                               data->linked_gpos[2]->gpo_guid,
                               data->linked_gpos[2]->gpo_dn,
+                              data->linked_gpos[2]->gpo_display_name,
                               data->linked_gpos[2]->gpo_container_version,
                               data->gpo_file_system_version_new,
                               5, now);
@@ -845,6 +851,7 @@ void test_check_gpo_cache_status_fs_version_change(void **state)
     ret = sysdb_gpo_store_gpo(test_ctx->tctx->dom,
                               data->linked_gpos[2]->gpo_guid,
                               data->linked_gpos[2]->gpo_dn,
+                              data->linked_gpos[2]->gpo_display_name,
                               data->linked_gpos[2]->gpo_container_version,
                               data->linked_gpos[2]->gpo_file_system_version,
                               5, now);
@@ -926,6 +933,7 @@ void test_check_gpo_cache_status_ad_version_change(void **state)
     ret = sysdb_gpo_store_gpo(test_ctx->tctx->dom,
                               data->linked_gpos[0]->gpo_guid,
                               data->linked_gpos[0]->gpo_dn,
+                              data->linked_gpos[0]->gpo_display_name,
                               data->gpo_container_version_new,
                               data->linked_gpos[0]->gpo_file_system_version,
                               5, now);
@@ -955,6 +963,7 @@ void test_check_gpo_cache_status_ad_version_change(void **state)
     ret = sysdb_gpo_store_gpo(test_ctx->tctx->dom,
                               data->linked_gpos[0]->gpo_guid,
                               data->linked_gpos[0]->gpo_dn,
+                              data->linked_gpos[0]->gpo_display_name,
                               data->linked_gpos[0]->gpo_container_version,
                               data->linked_gpos[0]->gpo_file_system_version,
                               5, now);
@@ -1038,6 +1047,7 @@ void test_check_gpo_cache_status_user_version_change(void **state)
         ret = sysdb_gpo_store_gpo(test_ctx->tctx->dom,
                                   data->linked_gpos[i]->gpo_guid,
                                   data->linked_gpos[i]->gpo_dn,
+                                  data->linked_gpos[i]->gpo_display_name,
                                   data->gpo_container_version_ignore,
                                   data->gpo_file_system_version_ignore,
                                   5, now);
@@ -1074,6 +1084,7 @@ void test_check_gpo_cache_status_user_version_change(void **state)
         ret = sysdb_gpo_store_gpo(test_ctx->tctx->dom,
                                   data->linked_gpos[i]->gpo_guid,
                                   data->linked_gpos[i]->gpo_dn,
+                                  data->linked_gpos[i]->gpo_display_name,
                                   data->linked_gpos[i]->gpo_container_version,
                                   data->linked_gpos[i]->gpo_file_system_version,
                                   5, now);
@@ -1345,6 +1356,7 @@ void test_check_gpo_cache_status_cse_gpo(void **state)
     ret = sysdb_gpo_store_gpo(test_ctx->tctx->dom,
                               data->linked_gpos[2]->gpo_guid,
                               data->linked_gpos[2]->gpo_dn,
+                              data->linked_gpos[2]->gpo_display_name,
                               data->linked_gpos[2]->gpo_container_version,
                               data->linked_gpos[2]->gpo_file_system_version,
                               5, now);

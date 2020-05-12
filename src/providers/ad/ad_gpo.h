@@ -31,7 +31,8 @@
 #define SMB_BUFFER_SIZE 65536
 
 #define AD_GPO_ATTRS {AD_AT_NT_SEC_DESC, \
-                      AD_AT_CN, AD_AT_FILE_SYS_PATH, \
+                      AD_AT_CN, AD_AT_DISPLAY_NAME, \
+                      AD_AT_FILE_SYS_PATH, \
                       AD_AT_MACHINE_EXT_NAMES, \
                       AD_AT_USER_EXT_NAMES, \
                       AD_AT_FUNC_VERSION, \
