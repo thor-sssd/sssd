@@ -3451,8 +3451,18 @@ test_sysdb_computer_LDADD = \
     $(LDB_LIBS) \
     $(POPT_LIBS) \
     $(TALLOC_LIBS) \
+    $(OPENLDAP_LIBS) \
+    $(SSSD_LIBS) \
     $(SSSD_INTERNAL_LTLIBS) \
+    $(NDR_NBT_LIBS) \
     libsss_test_common.la \
+    libsss_idmap.la \
+    libsss_krb5_common.la \
+    libsss_ad_tests.la \
+    libsss_test_common.la \
+    libdlopen_test_providers.la \
+    libsss_iface.la \
+    libsss_sbus.la \
     $(NULL)
 
 test_wbc_calls_SOURCES = \
