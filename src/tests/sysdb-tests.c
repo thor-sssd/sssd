@@ -7294,6 +7294,957 @@ START_TEST(test_gpo_replace)
 }
 END_TEST
 
+START_TEST(test_gpo_cse_store_retrieve)
+{
+    struct sysdb_test_ctx *test_ctx;
+    errno_t ret;
+    struct ldb_result *result = NULL;
+    struct ldb_message **results;
+    size_t count;
+    const char *guid;
+    int version;
+    time_t timeout;
+    int version_list[2];
+    int i;
+    static const char *test_cse_guid[] = {"{827D319E-6EAC-11D2-A4EA-00C04F79F83A}",
+                                          "{5794DAFD-BE60-433f-88A2-1A31939AC01F}",
+                                          "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}"};
+    static const char *test_guid[] = {"{2F1FD423-D089-4DF5-AFAA-8C2B0E340464}",
+                                      "{AB19E078-6405-40AA-BA43-635E95D090AF}",
+                                      "{32EF709E-1337-4947-8794-5E53E958F1AE}"};
+    static const char *test_dn[] = {
+        "cn={2F1FD423-D089-4DF5-AFAA-8C2B0E340464},cn=policies,cn=system,DC=example,DC=com",
+        "cn={AB19E078-6405-40AA-BA43-635E95D090AF},cn=policies,cn=system,DC=example,DC=com",
+        "cn={32EF709E-1337-4947-8794-5E53E958F1AE},cn=policies,cn=system,DC=example,DC=com"};
+    const char *gpo_attrs[] = SYSDB_GPO_ATTRS;
+    const char *gpo_cse_attrs[] = SYSDB_CSE_ATTRS;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    fail_if(ret != EOK, "Could not set up the test");
+
+    for(i=0; i<3; i++) {
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], test_cse_guid[i],
+                                        gpo_cse_attrs,
+                                        &result);
+        fail_if(ret != ENOENT, "GPO CSE present in cache before store op");
+    }
+
+    for(i=0; i<2; i++) {
+        ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                                   test_cse_guid[i], gpo_cse_attrs,
+                                   &count,
+                                   &results);
+        fail_if(ret != ENOENT, "GPO CSE present in cache before store op");
+    }
+
+    for(i=0; i<3; i++) {
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i],
+                                        gpo_attrs,
+                                        &result);
+        fail_if(ret != ENOENT, "GPO present in cache before store op");
+    }
+
+    for(i=0; i<3; i++) {
+        /* Version attribute contains GUID array index */
+        ret = sysdb_gpo_store_gpo(test_ctx->domain,
+                                  test_guid[i], test_dn[i], i, i, i, 1);
+        fail_if(ret != EOK, "Could not store a test GPO");
+
+        ret = sysdb_gpo_store_cse(test_ctx->domain,
+                                  test_guid[i], test_cse_guid[i], i, 3, 4);
+        fail_if(ret != EOK, "Could not store a test GPO CSE");
+    }
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid[0], gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "CSE GPOs not in cache after store op");
+    fail_if(count != 2);
+    for (i=0; i < 2; i++) {
+        fail_if(results[i] == NULL);
+        version_list[i] = ldb_msg_find_attr_as_uint(results[i],
+                                                    SYSDB_CSE_VERSION_ATTR, 0);
+        results[i] = NULL;
+    }
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid[1], gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "CSE GPOs not in cache after store op");
+    fail_if(count != 1);
+    fail_if(results[0] == NULL);
+    results[0] = NULL;
+
+    ret = sysdb_gpo_cse_search_parent_gpo(test_ctx, test_ctx->domain,
+                                          test_cse_guid[0], gpo_attrs,
+                                          &count,
+                                          &results);
+    fail_if(ret != EOK, "Parent GPO not in cache after store op");
+    fail_if(count != 2);
+    for (i=0; i < 2; i++) {
+        fail_if(results[i] == NULL);
+        version = ldb_msg_find_attr_as_uint(results[i],
+                                            SYSDB_GPO_SYSVOL_VERSION_ATTR, 0);
+        ck_assert_int_eq(version, version_list[i]);
+
+        guid = ldb_msg_find_attr_as_string(results[i],
+                                           SYSDB_GPO_GUID_ATTR, NULL);
+        ck_assert_str_eq(guid, test_guid[version]);
+
+        results[i] = NULL;
+    }
+
+    ret = sysdb_gpo_cse_search_parent_gpo(test_ctx, test_ctx->domain,
+                                          test_cse_guid[1], gpo_attrs,
+                                          &count,
+                                          &results);
+    fail_if(ret != EOK, "Parent GPO not in cache after store op");
+    fail_if(count != 1);
+    fail_if(results[0] == NULL);
+    guid = ldb_msg_find_attr_as_string(results[0],
+                                       SYSDB_GPO_GUID_ATTR, NULL);
+    ck_assert_str_eq(guid, test_guid[1]);
+
+    results[0] = NULL;
+
+    for (i=0; i < 3; i++) {
+        result = NULL;
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], test_cse_guid[i], gpo_cse_attrs,
+                                        &result);
+        fail_if(ret != EOK, "CSE not in cache after store op");
+        fail_if(result == NULL);
+        fail_if(result->count != 1);
+
+        guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                           SYSDB_CSE_GUID_ATTR, NULL);
+        ck_assert_str_eq(guid, test_cse_guid[i]);
+
+        version = ldb_msg_find_attr_as_uint(result->msgs[0],
+                                            SYSDB_CSE_VERSION_ATTR, 0);
+        ck_assert_int_eq(version, i);
+
+        timeout = ldb_msg_find_attr_as_uint64(result->msgs[0],
+                                              SYSDB_CSE_TIMEOUT_ATTR, 0);
+        ck_assert_int_eq(timeout, 7);
+    }
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
+START_TEST(test_gpo_cse_add)
+{
+    struct sysdb_test_ctx *test_ctx;
+    errno_t ret;
+    struct ldb_result *result = NULL;
+    struct ldb_message **results;
+    size_t count;
+    const char *guid;
+    int version;
+    time_t timeout;
+    int i;
+    static const char *test_cse_guid = "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}";
+    static const char *test_other_cse_guid = "{5794DAFD-BE60-433f-88A2-1A31939AC01F}";
+    static const char *test_guid[] = {"{2F1FD423-D089-4DF5-AFAA-8C2B0E340464}",
+                                      "{AB19E078-6405-40AA-BA43-635E95D090AF}",
+                                      "{32EF709E-1337-4947-8794-5E53E958F1AE}",
+                                      "{3610EDA5-77EF-11D2-8DC5-00C04FA31A66}"};
+    const char *gpo_attrs[] = SYSDB_GPO_ATTRS;
+    const char *gpo_cse_attrs[] = SYSDB_CSE_ATTRS;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    fail_if(ret != EOK, "Could not set up the test");
+
+    for(i=0; i<4; i++) {
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], test_cse_guid,
+                                        gpo_cse_attrs,
+                                        &result);
+        if (i == 1 || i == 3) {
+            fail_if(ret != ENOENT, "GPO CSE present in cache before add op");
+        } else {
+            fail_if(ret != EOK, "GPO CSE missing in cache before add op");
+        }
+
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], test_other_cse_guid,
+                                        gpo_cse_attrs,
+                                        &result);
+        if (i == 1) {
+            fail_if(ret != EOK, "GPO CSE missing in cache before add op");
+        } else {
+            fail_if(ret != ENOENT, "GPO CSE present in cache before add op");
+        }
+    }
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "CSE not in cache before add op");
+    fail_if(count != 2);
+
+    for(i=0; i<4; i++) {
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i],
+                                        gpo_attrs,
+                                        &result);
+        fail_if(ret == ENOENT, "GPO missing in cache before add op");
+    }
+
+    ret = sysdb_gpo_store_cse(test_ctx->domain,
+                              test_guid[1], test_cse_guid, 1, 3, 4);
+    fail_if(ret != EOK, "Could not store a test GPO CSE");
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "GPO CSE not in cache after add op");
+    fail_if(count != 3);
+    for (i=0; i < 3; i++) {
+        fail_if(results[i] == NULL);
+        results[i] = NULL;
+    }
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_other_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "GPO CSE not in cache after add op");
+    fail_if(count != 1);
+    fail_if(results[0] == NULL);
+    results[0] = NULL;
+
+    result = NULL;
+    ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                    test_guid[1], test_cse_guid, gpo_cse_attrs,
+                                    &result);
+    fail_if(ret != EOK, "CSE not in cache after add op");
+    fail_if(result == NULL);
+    fail_if(result->count != 1);
+
+    guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                       SYSDB_CSE_GUID_ATTR, NULL);
+    ck_assert_str_eq(guid, test_cse_guid);
+
+    version = ldb_msg_find_attr_as_uint(result->msgs[0],
+                                        SYSDB_CSE_VERSION_ATTR, 0);
+    ck_assert_int_eq(version, 1);
+
+    timeout = ldb_msg_find_attr_as_uint64(result->msgs[0],
+                                          SYSDB_CSE_TIMEOUT_ATTR, 0);
+    ck_assert_int_eq(timeout, 7);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
+START_TEST(test_gpo_cse_purge_all)
+{
+    struct sysdb_test_ctx *test_ctx;
+    errno_t ret;
+    struct ldb_result *result = NULL;
+    struct ldb_message **results;
+    size_t count;
+    const char *guid;
+    int version;
+    time_t timeout;
+    int i;
+    static const char *test_cse_guid = "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}";
+    static const char *test_other_cse_guid = "{5794DAFD-BE60-433f-88A2-1A31939AC01F}";
+    static const char *test_guid[] = {"{2F1FD423-D089-4DF5-AFAA-8C2B0E340464}",
+                                      "{AB19E078-6405-40AA-BA43-635E95D090AF}",
+                                      "{32EF709E-1337-4947-8794-5E53E958F1AE}",
+                                      "{3610EDA5-77EF-11D2-8DC5-00C04FA31A66}"};
+    const char *gpo_attrs[] = SYSDB_GPO_ATTRS;
+    const char *gpo_cse_attrs[] = SYSDB_CSE_ATTRS;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    fail_if(ret != EOK, "Could not set up the test");
+
+    for(i=0; i<4; i++) {
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], test_cse_guid,
+                                        gpo_cse_attrs,
+                                        &result);
+        if (i < 3) {
+            fail_if(ret != EOK, "GPO CSE missing in cache before delete op");
+        } else {
+            fail_if(ret != ENOENT, "CSE for empty GPO present in cache before delete op");
+        }
+
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], test_other_cse_guid,
+                                        gpo_cse_attrs,
+                                        &result);
+        if (i == 1) {
+            fail_if(ret != EOK, "GPO CSE missing in cache before delete op");
+        } else {
+            fail_if(ret != ENOENT, "GPO CSE present in cache before delete op");
+        }
+    }
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "CSE not in cache before delete op");
+    fail_if(count != 3);
+    for (i=0; i < 3; i++) {
+        fail_if(results[i] == NULL);
+        results[i] = NULL;
+    }
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_other_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "CSE not in cache before delete op");
+    fail_if(count != 1);
+    fail_if(results[0] == NULL);
+    results[0] = NULL;
+
+    for(i=0; i<4; i++) {
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i],
+                                        gpo_attrs,
+                                        &result);
+        fail_if(ret == ENOENT, "GPO missing in cache before delete op");
+    }
+
+    ret = sysdb_gpo_cse_purge(test_ctx->domain, test_cse_guid, NULL);
+    fail_if(ret != EOK, "Could not delete CSE");
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != ENOENT, "GPO CSE still present in cache after delete op");
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_other_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "Wrong GPO CSE removed from cache after delete op");
+    fail_if(count != 1);
+
+    for (i=0; i < 4; i++) {
+        result = NULL;
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], gpo_attrs, &result);
+        if (i == 1 || i == 3) {
+            fail_if(ret != EOK, "GPO [%d] not in cache after delete op", i);
+            fail_if(result == NULL);
+            fail_if(result->count != 1);
+            guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                               SYSDB_GPO_GUID_ATTR, NULL);
+            ck_assert_str_eq(guid, test_guid[i]);
+        } else {
+           fail_if(ret != ENOENT, "Empty GPO [%d] still in cache after delete op", i);
+        }
+    }
+
+    result = NULL;
+    ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                    test_guid[1], test_other_cse_guid, gpo_cse_attrs,
+                                    &result);
+    fail_if(ret != EOK, "Wrong CSE removed from cache by delete op");
+    fail_if(result == NULL);
+    fail_if(result->count != 1);
+
+    guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                       SYSDB_CSE_GUID_ATTR, NULL);
+    ck_assert_str_eq(guid, test_other_cse_guid);
+
+    version = ldb_msg_find_attr_as_uint(result->msgs[0],
+                                        SYSDB_CSE_VERSION_ATTR, 0);
+    ck_assert_int_eq(version, 1);
+
+    timeout = ldb_msg_find_attr_as_uint64(result->msgs[0],
+                                          SYSDB_CSE_TIMEOUT_ATTR, 0);
+    ck_assert_int_eq(timeout, 7);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
+START_TEST(test_gpo_cse_purge_filter)
+{
+    struct sysdb_test_ctx *test_ctx;
+    errno_t ret;
+    struct ldb_result *result = NULL;
+    struct ldb_message **results;
+    size_t count;
+    const char **cse_dn_list;
+    char *delete_filter;
+    int filter_element_count;
+    const char *guid;
+    int version;
+    time_t now;
+    time_t timeout;
+    int i;
+
+    static const char *test_cse_guid = "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}";
+    static const char *test_other_cse_guid = "{5794DAFD-BE60-433f-88A2-1A31939AC01F}";
+    static const char *test_guid[] = {"{2F1FD423-D089-4DF5-AFAA-8C2B0E340464}",
+                                      "{AB19E078-6405-40AA-BA43-635E95D090AF}",
+                                      "{32EF709E-1337-4947-8794-5E53E958F1AE}",
+                                      "{3610EDA5-77EF-11D2-8DC5-00C04FA31A66}"};
+    static const char *test_dn[] = {
+        "cn={2F1FD423-D089-4DF5-AFAA-8C2B0E340464},cn=policies,cn=system,DC=example,DC=com",
+        "cn={AB19E078-6405-40AA-BA43-635E95D090AF},cn=policies,cn=system,DC=example,DC=com",
+        "cn={32EF709E-1337-4947-8794-5E53E958F1AE},cn=policies,cn=system,DC=example,DC=com"};
+    const char *gpo_attrs[] = SYSDB_GPO_ATTRS;
+    const char *gpo_cse_attrs[] = SYSDB_CSE_ATTRS;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    fail_if(ret != EOK, "Could not set up the test");
+
+    for(i=0; i<4; i++) {
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], test_other_cse_guid,
+                                        gpo_cse_attrs,
+                                        &result);
+        if (i == 1) {
+            fail_if(ret != EOK, "GPO CSE missing in cache before purge op");
+        } else {
+            fail_if(ret != ENOENT, "GPO CSE present in cache before purge op");
+        }
+    }
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != ENOENT, "CSE present in cache before purge op");
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_other_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "CSE not in cache before purge op");
+    fail_if(count != 1);
+    fail_if(results[0] == NULL);
+    results[0] = NULL;
+
+    for(i=0; i<4; i++) {
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i],
+                                        gpo_attrs,
+                                        &result);
+        if (i == 1 || i == 3) {
+            fail_if(ret == ENOENT, "GPO missing in cache before purge op");
+        } else {
+            fail_if(ret == EOK, "GPO present in cache before purge op");
+        }
+    }
+
+    now = time(NULL);
+    for(i=0; i<3; i++) {
+        ret = sysdb_gpo_store_gpo(test_ctx->domain,
+                                  test_guid[i], test_dn[i], i, i, 5, now);
+        fail_if(ret != EOK, "Could not store a test GPO (%d)", i);
+
+        ret = sysdb_gpo_store_cse(test_ctx->domain,
+                                  test_guid[i], test_cse_guid, i, 10, now);
+        fail_if(ret != EOK, "Could not store a test GPO CSE [%d]", i);
+    }
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "CSE GPOs not in cache after store op");
+    fail_if(count != 3);
+
+    cse_dn_list = talloc_array(test_ctx, const char *, 3);
+    fail_if(cse_dn_list == NULL);
+
+    for(i=0; i<3; i++) {
+        cse_dn_list[i] = ldb_dn_get_linearized(results[i]->dn);
+        fail_if(cse_dn_list[i] == NULL);
+    }
+
+    ret = sysdb_gpo_cse_search_parent_gpo(test_ctx, test_ctx->domain,
+                                          test_cse_guid, gpo_attrs,
+                                          &count,
+                                          &results);
+    fail_if(ret != EOK, "Parent GPO not in cache after store op");
+    fail_if(count != 3);
+    for (i=0; i < 3; i++) {
+        fail_if(results[i] == NULL);
+        timeout = ldb_msg_find_attr_as_uint64(results[i],
+                                              SYSDB_GPO_TIMEOUT_ATTR, 0);
+        ck_assert_int_eq(timeout, now + 5);
+
+        guid = ldb_msg_find_attr_as_string(results[i],
+                                           SYSDB_GPO_GUID_ATTR, NULL);
+        ck_assert_str_eq(guid, test_guid[i]);
+
+        results[i] = NULL;
+    }
+
+    delete_filter = talloc_asprintf(test_ctx, "(&%s", SYSDB_CSE_FILTER);
+    fail_if(delete_filter == NULL);
+    filter_element_count = 1;
+    for (i=0; i < 3; i++) {
+        if (i < 2) {
+            delete_filter = talloc_asprintf_append(delete_filter, "(&(!(dn=%s))",
+                                                   cse_dn_list[i]);
+            filter_element_count++;
+        } else {
+            delete_filter = talloc_asprintf_append(delete_filter, "(!(dn=%s))",
+                                                   cse_dn_list[i]);
+        }
+        fail_if(delete_filter == NULL);
+    }
+    for (i=0; i < filter_element_count; i++) {
+        delete_filter = talloc_strdup_append(delete_filter, ")");
+        fail_if(delete_filter == NULL);
+    }
+
+    ret = sysdb_gpo_cse_purge(test_ctx->domain, test_cse_guid, delete_filter);
+    fail_if(ret != EOK, "Purge CSE failed");
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "Valid GPO CSE not in cache after purge op");
+    fail_if(count != 3);
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_other_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "Wrong GPO CSE removed from cache after purge op");
+    fail_if(count != 1);
+
+    for (i=0; i < 4; i++) {
+        result = NULL;
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], gpo_attrs, &result);
+        fail_if(ret != EOK, "GPO [%d] not in cache after purge op", i);
+        fail_if(result == NULL);
+        fail_if(result->count != 1);
+        guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                           SYSDB_GPO_GUID_ATTR, NULL);
+        ck_assert_str_eq(guid, test_guid[i]);
+    }
+
+    for (i=0; i < 3; i++) {
+        result = NULL;
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i],
+                                        test_cse_guid,
+                                        gpo_cse_attrs,
+                                        &result);
+        fail_if(ret != EOK, "CSE removed from cache by purge op");
+        fail_if(result == NULL);
+        fail_if(result->count != 1);
+
+        guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                           SYSDB_CSE_GUID_ATTR, NULL);
+        ck_assert_str_eq(guid, test_cse_guid);
+
+        version = ldb_msg_find_attr_as_uint(result->msgs[0],
+                                            SYSDB_CSE_VERSION_ATTR, 0);
+        ck_assert_int_eq(version, i);
+
+        timeout = ldb_msg_find_attr_as_uint64(result->msgs[0],
+                                              SYSDB_CSE_TIMEOUT_ATTR, 0);
+        ck_assert_int_eq(timeout, now + 10);
+    }
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
+START_TEST(test_gpo_cse_purge_wrong_filter)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    errno_t ret;
+    struct ldb_dn *userdn;
+    struct ldb_result *result = NULL;
+    struct ldb_message **results;
+    size_t count;
+    const char *cse_dn;
+    const char **cse_dn_list;
+    char *delete_filter;
+    int filter_element_count;
+    const char *guid;
+    int i;
+
+    static const char *test_cse_guid = "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}";
+    static const char *test_other_cse_guid = "{5794DAFD-BE60-433f-88A2-1A31939AC01F}";
+    static const char *test_guid[] = {"{2F1FD423-D089-4DF5-AFAA-8C2B0E340464}",
+                                      "{AB19E078-6405-40AA-BA43-635E95D090AF}",
+                                      "{32EF709E-1337-4947-8794-5E53E958F1AE}",
+                                      "{3610EDA5-77EF-11D2-8DC5-00C04FA31A66}"};
+    const char *gpo_attrs[] = SYSDB_GPO_ATTRS;
+    const char *gpo_cse_attrs[] = SYSDB_CSE_ATTRS;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    fail_if(ret != EOK, "Could not set up the test");
+
+    for(i=0; i<4; i++) {
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], test_other_cse_guid,
+                                        gpo_cse_attrs,
+                                        &result);
+        if (i == 1) {
+            fail_if(ret != EOK, "GPO CSE missing in cache before purge op");
+        } else {
+            fail_if(ret != ENOENT, "GPO CSE present in cache before purge op");
+        }
+    }
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "CSE GPOs not in cache before purge op");
+    fail_if(count != 3);
+
+    cse_dn_list = talloc_array(test_ctx, const char *, 3);
+    fail_if(cse_dn_list == NULL);
+
+    for(i=0; i<3; i++) {
+        cse_dn_list[i] = ldb_dn_get_linearized(results[i]->dn);
+        fail_if(cse_dn_list[i] == NULL);
+    }
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_other_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "CSE not in cache before purge op");
+    fail_if(count != 1);
+    fail_if(results[0] == NULL);
+    results[0] = NULL;
+
+    for(i=0; i<4; i++) {
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i],
+                                        gpo_attrs,
+                                        &result);
+        fail_if(ret != EOK, "GPO [%d] not present in cache before purge op", i);
+    }
+
+    /* Create something different from CSE to check that
+     * purge function does not remove objects other than
+     * CSEs and their parent GPOs from cache
+     */
+    data = test_data_new_user(test_ctx, 130667638);
+    fail_if(data == NULL);
+
+    ret = test_add_user(data);
+    fail_if(ret != EOK, "Could not add user %s", data->username);
+
+    delete_filter = talloc_asprintf(test_ctx, "(&(%s)", SYSDB_UC);
+    fail_if(delete_filter == NULL);
+    filter_element_count = 1;
+    for (i=0; i < 3; i++) {
+        if (i < 2) {
+            delete_filter = talloc_asprintf_append(delete_filter, "(&(!(dn=%s))",
+                                                   cse_dn_list[i]);
+            filter_element_count++;
+        } else {
+            delete_filter = talloc_asprintf_append(delete_filter, "(!(dn=%s))",
+                                                   cse_dn_list[i]);
+        }
+        fail_if(delete_filter == NULL);
+    }
+    for (i=0; i < filter_element_count; i++) {
+        delete_filter = talloc_strdup_append(delete_filter, ")");
+        fail_if(delete_filter == NULL);
+    }
+
+    ret = sysdb_gpo_cse_purge(test_ctx->domain, test_cse_guid, delete_filter);
+    fail_if(ret != EOK, "Purge CSE failed");
+
+    userdn = sysdb_user_dn(test_ctx, test_ctx->domain,
+                           data->username);
+    ck_assert(userdn != NULL);
+
+    talloc_zfree(delete_filter);
+
+    delete_filter = talloc_asprintf(test_ctx, "(&%s", SYSDB_GPO_FILTER);
+    fail_if(delete_filter == NULL);
+    filter_element_count = 1;
+    for (i=0; i < 3; i++) {
+        if (i < 2) {
+            delete_filter = talloc_asprintf_append(delete_filter, "(&(!(dn=%s))",
+                                                   cse_dn_list[i]);
+            filter_element_count++;
+        } else {
+            delete_filter = talloc_asprintf_append(delete_filter, "(!(dn=%s))",
+                                                   cse_dn_list[i]);
+        }
+        fail_if(delete_filter == NULL);
+    }
+    for (i=0; i < filter_element_count; i++) {
+        delete_filter = talloc_strdup_append(delete_filter, ")");
+        fail_if(delete_filter == NULL);
+    }
+
+    ret = sysdb_gpo_cse_purge(test_ctx->domain, test_cse_guid, delete_filter);
+    fail_if(ret != EOK, "Purge CSE failed");
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "Valid GPO CSE not in cache after purge op");
+    fail_if(count != 3);
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_other_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "Wrong GPO CSE removed from cache after purge op");
+    fail_if(count != 1);
+
+    cse_dn = ldb_dn_get_linearized(results[0]->dn);
+
+    for (i=0; i < 4; i++) {
+        result = NULL;
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], gpo_attrs, &result);
+        fail_if(ret != EOK, "GPO [%d] not in cache after purge op", i);
+        fail_if(result == NULL);
+        fail_if(result->count != 1);
+        guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                           SYSDB_GPO_GUID_ATTR, NULL);
+        ck_assert_str_eq(guid, test_guid[i]);
+    }
+
+    talloc_zfree(delete_filter);
+
+    delete_filter = talloc_asprintf(test_ctx, "(&%s(dn=%s))",
+                                    SYSDB_CSE_FILTER, cse_dn);
+    fail_if(delete_filter == NULL);
+
+    ret = sysdb_gpo_cse_purge(test_ctx->domain, test_cse_guid, delete_filter);
+    fail_if(ret != EOK, "Purge CSE failed");
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "Valid GPO CSE not in cache after purge op");
+    fail_if(count != 3);
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_other_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "Wrong GPO CSE removed from cache after purge op");
+    fail_if(count != 1);
+
+    for (i=0; i < 4; i++) {
+        result = NULL;
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], gpo_attrs, &result);
+        fail_if(ret != EOK, "GPO [%d] not in cache after purge op", i);
+        fail_if(result == NULL);
+        fail_if(result->count != 1);
+        guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                           SYSDB_GPO_GUID_ATTR, NULL);
+        ck_assert_str_eq(guid, test_guid[i]);
+    }
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
+START_TEST(test_gpo_cse_purge_parent_gpo)
+{
+    struct sysdb_test_ctx *test_ctx;
+    errno_t ret;
+    struct ldb_result *result = NULL;
+    struct ldb_message **results;
+    size_t count;
+    const char *cse_dn;
+    char *delete_filter;
+    const char *guid;
+    time_t now;
+    time_t timeout;
+    int i;
+
+    static const char *test_cse_guid = "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}";
+    static const char *test_other_cse_guid = "{5794DAFD-BE60-433f-88A2-1A31939AC01F}";
+    static const char *test_guid[] = {"{2F1FD423-D089-4DF5-AFAA-8C2B0E340464}",
+                                      "{AB19E078-6405-40AA-BA43-635E95D090AF}",
+                                      "{32EF709E-1337-4947-8794-5E53E958F1AE}",
+                                      "{3610EDA5-77EF-11D2-8DC5-00C04FA31A66}"};
+    static const char *no_parent_guid = "{92484C5E-27CA-40DC-8D08-F1C42B17236C}";
+    static const char *test_dn[] = {
+        "cn={2F1FD423-D089-4DF5-AFAA-8C2B0E340464},cn=policies,cn=system,DC=example,DC=com",
+        "cn={AB19E078-6405-40AA-BA43-635E95D090AF},cn=policies,cn=system,DC=example,DC=com",
+        "cn={32EF709E-1337-4947-8794-5E53E958F1AE},cn=policies,cn=system,DC=example,DC=com",
+        "cn={3610EDA5-77EF-11D2-8DC5-00C04FA31A66},cn=policies,cn=system,DC=example,DC=com"};
+    const char *gpo_attrs[] = SYSDB_GPO_ATTRS;
+    const char *gpo_cse_attrs[] = SYSDB_CSE_ATTRS;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    fail_if(ret != EOK, "Could not set up the test");
+
+    for(i=0; i<4; i++) {
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], test_other_cse_guid,
+                                        gpo_cse_attrs,
+                                        &result);
+        if (i == 1) {
+            fail_if(ret != EOK, "GPO CSE missing in cache before purge op");
+        } else {
+            fail_if(ret != ENOENT, "GPO CSE present in cache before purge op");
+        }
+    }
+
+    now = time(NULL);
+    for(i=0; i<4; i++) {
+        if (i != 2) {
+            ret = sysdb_gpo_store_gpo(test_ctx->domain,
+                                      test_guid[i], test_dn[i], i, i, 5, now - 6);
+            fail_if(ret != EOK, "Could not store a test GPO (%d)", i);
+        } else {
+            ret = sysdb_gpo_store_gpo(test_ctx->domain,
+                                      test_guid[i], test_dn[i], i, i, 5, now);
+            fail_if(ret != EOK, "Could not store a test GPO (%d)", i);
+        }
+        ret = sysdb_gpo_store_cse(test_ctx->domain,
+                                  test_guid[i], test_cse_guid, i, 10, now);
+        fail_if(ret != EOK, "Could not store a test GPO CSE [%d]", i);
+    }
+
+    ret = sysdb_gpo_store_cse(test_ctx->domain,
+                              no_parent_guid, test_cse_guid, 4, 10, now);
+    fail_if(ret != EOK, "Could not store a test GPO CSE [%d]", 4);
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "CSE GPOs not in cache after store op");
+    fail_if(count != 5);
+
+    cse_dn = ldb_dn_get_linearized(results[3]->dn);
+    fail_if(cse_dn == NULL);
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_other_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "GPO CSE not in cache after store op");
+    fail_if(count != 1);
+
+    ret = sysdb_gpo_cse_search_parent_gpo(test_ctx, test_ctx->domain,
+                                          test_cse_guid, gpo_attrs,
+                                          &count,
+                                          &results);
+    fail_if(ret != ENOENT, "Missing parent GPO in cache not identified");
+
+    for (i=0; i < 4; i++) {
+        result = NULL;
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], gpo_attrs, &result);
+        fail_if(ret != EOK, "GPO [%d] not in cache after store op", i);
+        fail_if(result == NULL);
+        fail_if(result->count != 1);
+        guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                           SYSDB_GPO_GUID_ATTR, NULL);
+        ck_assert_str_eq(guid, test_guid[i]);
+
+        timeout = ldb_msg_find_attr_as_uint64(result->msgs[0],
+                                              SYSDB_GPO_TIMEOUT_ATTR, 0);
+        if (i != 2) {
+            ck_assert_int_eq(timeout, now - 1);
+        } else {
+            ck_assert_int_eq(timeout, now + 5);
+        }
+    }
+
+    delete_filter = talloc_asprintf(test_ctx, "(&%s(!(dn=%s)))",
+                                    SYSDB_CSE_FILTER, cse_dn);
+    fail_if(delete_filter == NULL);
+
+    ret = sysdb_gpo_cse_purge(test_ctx->domain, test_cse_guid, delete_filter);
+    fail_if(ret != EOK, "Purge CSE failed");
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "Valid GPO CSE not in cache after purge op");
+    fail_if(count != 1);
+
+    ret = sysdb_gpo_cse_search(test_ctx, test_ctx->domain,
+                               test_other_cse_guid, gpo_cse_attrs,
+                               &count,
+                               &results);
+    fail_if(ret != EOK, "Wrong GPO CSE removed from cache after purge op");
+    fail_if(count != 1);
+
+    for (i=0; i < 4; i++) {
+        result = NULL;
+        ret = sysdb_gpo_get_gpo_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i], gpo_attrs, &result);
+        if (i > 0) {
+            fail_if(ret != EOK, "GPO [%d] not in cache after purge op", i);
+            fail_if(result == NULL);
+            fail_if(result->count != 1);
+            guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                               SYSDB_GPO_GUID_ATTR, NULL);
+            ck_assert_str_eq(guid, test_guid[i]);
+        } else {
+            fail_if(ret != ENOENT, "GPO [%d] still in cache after purge op", i);
+        }
+    }
+
+    for (i=0; i < 4; i++) {
+        result = NULL;
+        ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                        test_guid[i],
+                                        test_cse_guid,
+                                        gpo_cse_attrs,
+                                        &result);
+        if (i == 3) {
+            fail_if(ret != EOK, "GPO CSE [%d] not in cache after purge op", i);
+            fail_if(result == NULL);
+            fail_if(result->count != 1);
+            guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                               SYSDB_CSE_GUID_ATTR, NULL);
+            ck_assert_str_eq(guid, test_cse_guid);
+        } else {
+            fail_if(ret != ENOENT,
+                    "GPO CSE [%d] still in cache after purge op", i);
+        }
+    }
+
+    ret = sysdb_gpo_get_cse_by_guid(test_ctx, test_ctx->domain,
+                                    test_guid[1],
+                                    test_other_cse_guid,
+                                    gpo_cse_attrs,
+                                    &result);
+    fail_if(ret != EOK, "GPO CSE [%d] not in cache after purge op", 1);
+    fail_if(result == NULL);
+    fail_if(result->count != 1);
+    guid = ldb_msg_find_attr_as_string(result->msgs[0],
+                                       SYSDB_CSE_GUID_ATTR, NULL);
+    ck_assert_str_eq(guid, test_other_cse_guid);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
 START_TEST(test_gpo_result)
 {
     errno_t ret;
@@ -8273,6 +9224,12 @@ Suite *create_sysdb_suite(void)
     TCase *tc_gpo = tcase_create("SYSDB GPO tests");
     tcase_add_test(tc_gpo, test_gpo_store_retrieve);
     tcase_add_test(tc_gpo, test_gpo_replace);
+    tcase_add_test(tc_gpo, test_gpo_cse_store_retrieve);
+    tcase_add_test(tc_gpo, test_gpo_cse_add);
+    tcase_add_test(tc_gpo, test_gpo_cse_purge_all);
+    tcase_add_test(tc_gpo, test_gpo_cse_purge_filter);
+    tcase_add_test(tc_gpo, test_gpo_cse_purge_wrong_filter);
+    tcase_add_test(tc_gpo, test_gpo_cse_purge_parent_gpo);
     tcase_add_test(tc_gpo, test_gpo_result);
     suite_add_tcase(s, tc_gpo);
 
