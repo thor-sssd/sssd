@@ -266,6 +266,7 @@ if HAVE_CMOCKA
         test_sysdb_sudo \
         test_sysdb_utils \
         test_sysdb_domain_resolution_order \
+        test_sysdb_computer \
         test_wbc_calls \
         test_be_ptask \
         test_copy_ccache \
@@ -3430,6 +3431,22 @@ test_sysdb_domain_resolution_order_CFLAGS = \
     $(AM_CFLAGS) \
     $(NULL)
 test_sysdb_domain_resolution_order_LDADD = \
+    $(CMOCKA_LIBS) \
+    $(LDB_LIBS) \
+    $(POPT_LIBS) \
+    $(TALLOC_LIBS) \
+    $(SSSD_INTERNAL_LTLIBS) \
+    libsss_test_common.la \
+    $(NULL)
+
+test_sysdb_computer_SOURCES = \
+    src/tests/cmocka/test_sysdb_computer.c \
+    $(NULL)
+test_sysdb_computer_CFLAGS = \
+    $(AM_CFLAGS) \
+    $(NDR_NBT_CFLAGS) \
+    $(NULL)
+test_sysdb_computer_LDADD = \
     $(CMOCKA_LIBS) \
     $(LDB_LIBS) \
     $(POPT_LIBS) \
