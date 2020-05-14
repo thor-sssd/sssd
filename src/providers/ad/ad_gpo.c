@@ -6024,6 +6024,8 @@ ad_gpo_cache_file_send(TALLOC_CTX *mem_ctx,
     struct tevent_req *subreq;
     struct ad_gpo_cache_file_state *state;
     struct io_buffer *buf = NULL;
+    const char *cache_file_name;
+    FILE *fp;
     errno_t ret;
 
     req = tevent_req_create(mem_ctx, &state,
@@ -6034,12 +6036,27 @@ ad_gpo_cache_file_send(TALLOC_CTX *mem_ctx,
     }
 
     if (!send_to_child) {
-        /*
-         * if we don't need to talk to child (b/c cache timeout is still valid),
-         * we simply complete the request
-         */
-        ret = EOK;
-        goto immediately;
+        cache_file_name = talloc_asprintf(state,
+                                          GPO_CACHE_PATH"/%s%s",
+                                          smb_path,
+                                          smb_file_suffix);
+        if (cache_file_name == NULL) {
+            ret = ENOMEM;
+            goto immediately;
+        }
+        fp = fopen(cache_file_name, "r");
+        if (fp != NULL) {
+            /*
+             * if we don't need to talk to child (b/c cache timeout is still
+             * valid and group policy file still in file cache), we simply
+             * complete the request */
+            fclose(fp);
+            ret = EOK;
+            goto immediately;
+        }
+        DEBUG(SSSDBG_MINOR_FAILURE,
+              "Couldn't find group policy file in file cache [%s]\n",
+              cache_file_name);
     }
 
     state->ev = ev;
